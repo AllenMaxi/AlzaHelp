@@ -399,7 +399,7 @@ async def update_family_member(
     update_data = {k: v for k, v in member.model_dump().items() if v is not None}
     update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
     
-    # Update embedding if name or notes changed
+    # Update search text if name or notes changed
     if 'name' in update_data or 'notes' in update_data or 'relationship' in update_data:
         existing = await db.family_members.find_one(
             {"id": member_id, "user_id": current_user.user_id},
@@ -408,16 +408,9 @@ async def update_family_member(
         if existing:
             name = update_data.get('name', existing.get('name', ''))
             relationship = update_data.get('relationship', existing.get('relationship', ''))
+            relationship_label = update_data.get('relationship_label', existing.get('relationship_label', ''))
             notes = update_data.get('notes', existing.get('notes', ''))
-            text_for_embedding = f"{name} {relationship} {notes}"
-            try:
-                embedding_response = await openai_client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=text_for_embedding
-                )
-                update_data['embedding'] = embedding_response.data[0].embedding
-            except Exception as e:
-                logger.error(f"Error creating embedding: {e}")
+            update_data['search_text'] = f"{name} {relationship} {relationship_label} {notes}".lower()
     
     result = await db.family_members.update_one(
         {"id": member_id, "user_id": current_user.user_id},
@@ -429,7 +422,7 @@ async def update_family_member(
     
     updated = await db.family_members.find_one(
         {"id": member_id},
-        {"_id": 0, "embedding": 0}
+        {"_id": 0, "search_text": 0}
     )
     return updated
 
