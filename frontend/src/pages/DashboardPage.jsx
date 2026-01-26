@@ -6,8 +6,11 @@ import { FamilySection } from "@/components/sections/FamilySection";
 import { TimelineSection } from "@/components/sections/TimelineSection";
 import { AssistantSection } from "@/components/sections/AssistantSection";
 import { RemindersSection } from "@/components/sections/RemindersSection";
+import { WhoIsThisQuiz } from "@/components/sections/WhoIsThisQuiz";
+import { PhotoStories } from "@/components/sections/PhotoStories";
+import { WeekMemories } from "@/components/sections/WeekMemories";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Users, Calendar, MessageCircle, Bell, Heart } from "lucide-react";
+import { Users, Calendar, MessageCircle, Bell, Heart, Brain, Film, CalendarDays } from "lucide-react";
 import { familyApi, memoriesApi, remindersApi } from "@/services/api";
 
 export const DashboardPage = () => {
@@ -72,6 +75,9 @@ export const DashboardPage = () => {
   const tabItems = [
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
+    { id: 'quiz', label: 'Quiz', icon: Brain },
+    { id: 'stories', label: 'Stories', icon: Film },
+    { id: 'week', label: 'My Week', icon: CalendarDays },
     { id: 'assistant', label: 'Ask Me', icon: MessageCircle },
     { id: 'reminders', label: 'Today', icon: Bell },
   ];
@@ -116,14 +122,14 @@ export const DashboardPage = () => {
           <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
             <div className="sticky top-20 z-40 bg-background/95 backdrop-blur border-b border-border">
               <div className="container mx-auto px-4 sm:px-6 lg:px-8">
-                <TabsList className="h-auto p-2 bg-muted/50 rounded-2xl my-4 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <TabsList className="h-auto p-2 bg-muted/50 rounded-2xl my-4 flex flex-wrap justify-center gap-2">
                   {tabItems.map((tab) => {
                     const Icon = tab.icon;
                     return (
                       <TabsTrigger
                         key={tab.id}
                         value={tab.id}
-                        className="flex items-center gap-2 py-4 px-6 text-lg font-semibold rounded-xl data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-card transition-all duration-300"
+                        className="flex items-center gap-2 py-3 px-4 text-base font-semibold rounded-xl data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-card transition-all duration-300"
                       >
                         <Icon className="h-5 w-5" />
                         <span className="hidden sm:inline">{tab.label}</span>
@@ -148,6 +154,27 @@ export const DashboardPage = () => {
                 familyMembers={familyMembers}
                 onRefresh={refreshMemories}
                 loading={loading}
+              />
+            </TabsContent>
+
+            <TabsContent value="quiz" className="mt-0 animate-fade-in">
+              <WhoIsThisQuiz 
+                familyMembers={familyMembers}
+              />
+            </TabsContent>
+
+            <TabsContent value="stories" className="mt-0 animate-fade-in">
+              <PhotoStories 
+                memories={memories}
+                familyMembers={familyMembers}
+              />
+            </TabsContent>
+
+            <TabsContent value="week" className="mt-0 animate-fade-in">
+              <WeekMemories 
+                memories={memories}
+                reminders={reminders}
+                familyMembers={familyMembers}
               />
             </TabsContent>
             
