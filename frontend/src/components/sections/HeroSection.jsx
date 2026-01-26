@@ -1,5 +1,5 @@
 import React from 'react';
-import { Heart, Users, Calendar, MessageCircle, Brain, Film, CalendarDays } from 'lucide-react';
+import { Heart, Users, Calendar, MessageCircle, Brain, Film, CalendarDays, Bell } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' }) => {
