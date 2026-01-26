@@ -467,23 +467,15 @@ async def create_memory(
     doc['created_at'] = doc['created_at'].isoformat()
     doc['updated_at'] = doc['updated_at'].isoformat()
     
-    # Generate embedding for RAG
+    # Store searchable text for keyword search
     people_str = ", ".join(memory.people) if memory.people else ""
-    text_for_embedding = f"{memory.title} {memory.date} {memory.location or ''} {memory.description} {people_str}"
-    try:
-        embedding_response = await openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text_for_embedding
-        )
-        doc['embedding'] = embedding_response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Error creating embedding: {e}")
+    doc['search_text'] = f"{memory.title} {memory.date} {memory.location or ''} {memory.description} {people_str}".lower()
     
     await db.memories.insert_one(doc)
     
-    # Return without embedding and _id
-    if 'embedding' in doc:
-        del doc['embedding']
+    # Return without search_text and _id
+    if 'search_text' in doc:
+        del doc['search_text']
     if '_id' in doc:
         del doc['_id']
     return doc
