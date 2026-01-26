@@ -1,13 +1,28 @@
 import React from 'react';
-import { Heart, Sun, Moon, Home, Menu } from 'lucide-react';
+import { Heart, Sun, Moon, Home, Menu, LogOut, User } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger, SheetTitle } from '@/components/ui/sheet';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+import { useAuth } from '@/context/AuthContext';
 
-export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode }) => {
+export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode, user }) => {
+  const { logout } = useAuth();
+  
   const navItems = [
     { id: 'home', label: 'Home', icon: Home },
     { id: 'memories', label: 'My Memories', icon: Heart },
   ];
+
+  const handleLogout = async () => {
+    await logout();
+    window.location.href = '/login';
+  };
+
+  const getInitials = (name) => {
+    if (!name) return 'U';
+    return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
+  };
 
   return (
     <header className="sticky top-0 z-50 w-full border-b border-border/50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
@@ -47,7 +62,7 @@ export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode }) =
             })}
           </nav>
 
-          {/* Right side - Theme toggle and mobile menu */}
+          {/* Right side - User menu, Theme toggle and mobile menu */}
           <div className="flex items-center gap-3">
             <Button
               variant="outline"
@@ -63,6 +78,34 @@ export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode }) =
               )}
             </Button>
 
+            {/* User Menu */}
+            {user && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" className="h-12 gap-2 px-3">
+                    <Avatar className="h-9 w-9">
+                      <AvatarImage src={user.picture} alt={user.name} />
+                      <AvatarFallback className="bg-primary text-primary-foreground">
+                        {getInitials(user.name)}
+                      </AvatarFallback>
+                    </Avatar>
+                    <span className="hidden sm:inline text-base font-medium">{user.name?.split(' ')[0]}</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <div className="p-3">
+                    <p className="font-semibold">{user.name}</p>
+                    <p className="text-sm text-muted-foreground">{user.email}</p>
+                  </div>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={handleLogout} className="text-destructive cursor-pointer py-3">
+                    <LogOut className="h-5 w-5 mr-2" />
+                    Sign Out
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+
             {/* Mobile Menu */}
             <Sheet>
               <SheetTrigger asChild className="md:hidden">
@@ -72,7 +115,23 @@ export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode }) =
               </SheetTrigger>
               <SheetContent side="right" className="w-[300px] sm:w-[350px]">
                 <SheetTitle className="text-2xl font-bold mb-8">Menu</SheetTitle>
-                <nav className="flex flex-col gap-4 mt-8">
+                
+                {user && (
+                  <div className="flex items-center gap-3 p-4 bg-muted rounded-xl mb-6">
+                    <Avatar className="h-12 w-12">
+                      <AvatarImage src={user.picture} alt={user.name} />
+                      <AvatarFallback className="bg-primary text-primary-foreground text-lg">
+                        {getInitials(user.name)}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div>
+                      <p className="font-semibold">{user.name}</p>
+                      <p className="text-sm text-muted-foreground">{user.email}</p>
+                    </div>
+                  </div>
+                )}
+                
+                <nav className="flex flex-col gap-4">
                   {navItems.map((item) => {
                     const Icon = item.icon;
                     const isActive = currentView === item.id;
@@ -88,6 +147,15 @@ export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode }) =
                       </Button>
                     );
                   })}
+                  
+                  <Button
+                    variant="destructive"
+                    onClick={handleLogout}
+                    className="justify-start gap-4 mt-4"
+                  >
+                    <LogOut className="h-6 w-6" />
+                    <span>Sign Out</span>
+                  </Button>
                 </nav>
               </SheetContent>
             </Sheet>

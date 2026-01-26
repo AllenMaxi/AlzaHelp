@@ -2,7 +2,7 @@ import React from 'react';
 import { Heart, Users, Calendar, MessageCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
-export const HeroSection = ({ setCurrentView, setActiveTab }) => {
+export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' }) => {
   const quickActions = [
     {
       id: 'family',
@@ -58,7 +58,7 @@ export const HeroSection = ({ setCurrentView, setActiveTab }) => {
             </div>
             
             <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-bold text-foreground leading-tight mb-6">
-              Hello, <span className="text-primary">Friend</span>
+              Hello, <span className="text-primary">{userName}</span>
             </h1>
             
             <p className="text-accessible text-muted-foreground max-w-xl mx-auto lg:mx-0 mb-8">
