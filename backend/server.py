@@ -614,59 +614,71 @@ async def reset_reminders(current_user: User = Depends(get_current_user)):
 
 # ==================== RAG CHAT ====================
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Calculate cosine similarity between two vectors"""
-    a_np = np.array(a)
-    b_np = np.array(b)
-    return float(np.dot(a_np, b_np) / (np.linalg.norm(a_np) * np.linalg.norm(b_np)))
-
-async def search_similar_content(user_id: str, query: str, top_k: int = 5) -> dict:
-    """Search for similar memories and family members using embeddings"""
-    # Generate query embedding
-    try:
-        embedding_response = await openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=query
-        )
-        query_embedding = embedding_response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Error creating query embedding: {e}")
-        return {"memories": [], "family": []}
+def keyword_match_score(query: str, text: str) -> float:
+    """Calculate keyword match score between query and text"""
+    if not text:
+        return 0.0
     
-    # Get all memories with embeddings
+    query_words = set(re.findall(r'\w+', query.lower()))
+    text_words = set(re.findall(r'\w+', text.lower()))
+    
+    # Common words to filter out
+    stop_words = {'is', 'my', 'the', 'a', 'an', 'who', 'what', 'when', 'where', 'how', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'or', 'and', 'but', 'not', 'so', 'if', 'then', 'than', 'too', 'very', 'just', 'about', 'me', 'tell', 'us', 'them', 'their', 'i'}
+    
+    query_words = query_words - stop_words
+    
+    if not query_words:
+        return 0.0
+    
+    # Check for exact matches and partial matches
+    matches = 0
+    for q_word in query_words:
+        if q_word in text_words:
+            matches += 2  # Exact match
+        elif any(q_word in t_word or t_word in q_word for t_word in text_words):
+            matches += 1  # Partial match
+    
+    return matches / (len(query_words) * 2)  # Normalize to 0-1
+
+async def search_similar_content(user_id: str, query: str, top_k: int = 10) -> dict:
+    """Search for similar memories and family members using keyword matching"""
+    
+    # Get all memories
     memories = await db.memories.find(
-        {"user_id": user_id, "embedding": {"$exists": True}},
-        {"_id": 0}
+        {"user_id": user_id},
+        {"_id": 0, "search_text": 0}
     ).to_list(500)
     
-    # Get all family members with embeddings
+    # Get all family members
     family = await db.family_members.find(
-        {"user_id": user_id, "embedding": {"$exists": True}},
-        {"_id": 0}
+        {"user_id": user_id},
+        {"_id": 0, "search_text": 0}
     ).to_list(100)
     
-    # Calculate similarities for memories
+    # Calculate scores for memories
     memory_scores = []
     for mem in memories:
-        if mem.get('embedding'):
-            score = cosine_similarity(query_embedding, mem['embedding'])
-            mem_copy = {k: v for k, v in mem.items() if k != 'embedding'}
-            memory_scores.append((score, mem_copy))
+        # Build search text from memory fields
+        search_text = f"{mem.get('title', '')} {mem.get('date', '')} {mem.get('location', '')} {mem.get('description', '')} {' '.join(mem.get('people', []))}"
+        score = keyword_match_score(query, search_text)
+        if score > 0:
+            memory_scores.append((score, mem))
     
-    # Calculate similarities for family
+    # Calculate scores for family
     family_scores = []
     for fam in family:
-        if fam.get('embedding'):
-            score = cosine_similarity(query_embedding, fam['embedding'])
-            fam_copy = {k: v for k, v in fam.items() if k != 'embedding'}
-            family_scores.append((score, fam_copy))
+        # Build search text from family fields
+        search_text = f"{fam.get('name', '')} {fam.get('relationship', '')} {fam.get('relationship_label', '')} {fam.get('notes', '')} {fam.get('category', '')}"
+        score = keyword_match_score(query, search_text)
+        if score > 0:
+            family_scores.append((score, fam))
     
     # Sort and get top results
     memory_scores.sort(key=lambda x: x[0], reverse=True)
     family_scores.sort(key=lambda x: x[0], reverse=True)
     
-    top_memories = [m[1] for m in memory_scores[:top_k] if m[0] > 0.3]
-    top_family = [f[1] for f in family_scores[:top_k] if f[0] > 0.3]
+    top_memories = [m[1] for m in memory_scores[:top_k]]
+    top_family = [f[1] for f in family_scores[:top_k]]
     
     return {"memories": top_memories, "family": top_family}
 
