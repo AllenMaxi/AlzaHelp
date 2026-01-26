@@ -161,13 +161,6 @@ export const DashboardPage = () => {
               />
             </TabsContent>
 
-            <TabsContent value="stories" className="mt-0 animate-fade-in">
-              <PhotoStories 
-                memories={memories}
-                familyMembers={familyMembers}
-              />
-            </TabsContent>
-
             <TabsContent value="week" className="mt-0 animate-fade-in">
               <WeekMemories 
                 memories={memories}
