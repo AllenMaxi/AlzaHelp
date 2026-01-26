@@ -1,5 +1,5 @@
 import React from 'react';
-import { Heart, Users, Calendar, MessageCircle } from 'lucide-react';
+import { Heart, Users, Calendar, MessageCircle, Brain, Film, CalendarDays } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' }) => {
@@ -21,20 +21,36 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
       tab: 'timeline'
     },
     {
+      id: 'quiz',
+      label: 'Memory Game',
+      description: 'Practice remembering faces',
+      icon: Brain,
+      color: 'bg-accent/20 border-accent hover:bg-accent/30',
+      tab: 'quiz'
+    },
+    {
+      id: 'stories',
+      label: 'Photo Stories',
+      description: 'Watch & listen to memories',
+      icon: Film,
+      color: 'bg-primary/20 border-primary hover:bg-primary/30',
+      tab: 'stories'
+    },
+    {
+      id: 'week',
+      label: 'My Week',
+      description: 'What did I do recently?',
+      icon: CalendarDays,
+      color: 'bg-family-grandchildren/20 border-family-grandchildren hover:bg-family-grandchildren/30',
+      tab: 'week'
+    },
+    {
       id: 'ask',
       label: 'Ask Me',
       description: 'I can help you remember',
       icon: MessageCircle,
-      color: 'bg-family-grandchildren/20 border-family-grandchildren hover:bg-family-grandchildren/30',
-      tab: 'assistant'
-    },
-    {
-      id: 'reminders',
-      label: 'Today',
-      description: 'Your daily reminders',
-      icon: Heart,
       color: 'bg-success/20 border-success hover:bg-success/30',
-      tab: 'reminders'
+      tab: 'assistant'
     },
   ];
 
@@ -63,7 +79,7 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
             
             <p className="text-accessible text-muted-foreground max-w-xl mx-auto lg:mx-0 mb-8">
               All your precious memories and loved ones are right here. 
-              Just tap a button to see your family, remember special moments, 
+              Just tap a button to see your family, play memory games, 
               or ask me anything you'd like to know.
             </p>
 
@@ -80,11 +96,11 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
               <Button 
                 variant="accessible-outline" 
                 size="xl"
-                onClick={() => handleQuickAction('assistant')}
+                onClick={() => handleQuickAction('quiz')}
                 className="gap-3"
               >
-                <MessageCircle className="h-7 w-7" />
-                Ask a Question
+                <Brain className="h-7 w-7" />
+                Play Memory Game
               </Button>
             </div>
           </div>
@@ -115,7 +131,7 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
             What would you like to do?
           </h2>
           
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
             {quickActions.map((action, index) => {
               const Icon = action.icon;
               return (
