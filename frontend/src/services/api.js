@@ -89,7 +89,7 @@ export const chatApi = {
   getHistory: (sessionId) => fetchWithAuth(`/api/chat/history/${sessionId}`),
 };
 
-// Upload API
+// Upload API (files stored in MongoDB GridFS)
 export const uploadApi = {
   uploadFile: async (file) => {
     const formData = new FormData();
@@ -106,7 +106,7 @@ export const uploadApi = {
     }
     
     const data = await response.json();
-    // Return full URL
+    // Return full URL - files are now served from /api/files/
     return `${BACKEND_URL}${data.url}`;
   },
   
