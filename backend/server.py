@@ -490,7 +490,7 @@ async def update_memory(
     update_data = {k: v for k, v in memory.model_dump().items() if v is not None}
     update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
     
-    # Update embedding
+    # Update search text
     existing = await db.memories.find_one(
         {"id": memory_id, "user_id": current_user.user_id},
         {"_id": 0}
@@ -502,15 +502,7 @@ async def update_memory(
         description = update_data.get('description', existing.get('description', ''))
         people = update_data.get('people', existing.get('people', []))
         people_str = ", ".join(people) if people else ""
-        text_for_embedding = f"{title} {date} {location} {description} {people_str}"
-        try:
-            embedding_response = await openai_client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text_for_embedding
-            )
-            update_data['embedding'] = embedding_response.data[0].embedding
-        except Exception as e:
-            logger.error(f"Error creating embedding: {e}")
+        update_data['search_text'] = f"{title} {date} {location} {description} {people_str}".lower()
     
     result = await db.memories.update_one(
         {"id": memory_id, "user_id": current_user.user_id},
@@ -522,7 +514,7 @@ async def update_memory(
     
     updated = await db.memories.find_one(
         {"id": memory_id},
-        {"_id": 0, "embedding": 0}
+        {"_id": 0, "search_text": 0}
     )
     return updated
 
