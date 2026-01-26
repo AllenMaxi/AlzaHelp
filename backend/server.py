@@ -500,9 +500,11 @@ async def create_memory(
     
     await db.memories.insert_one(doc)
     
-    # Return without embedding
+    # Return without embedding and _id
     if 'embedding' in doc:
         del doc['embedding']
+    if '_id' in doc:
+        del doc['_id']
     return doc
 
 @api_router.put("/memories/{memory_id}", response_model=dict)
