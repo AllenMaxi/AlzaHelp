@@ -1,5 +1,5 @@
 import React from 'react';
-import { Heart, Users, Calendar, MessageCircle, Brain, Film, CalendarDays, Bell } from 'lucide-react';
+import { Heart, Users, Calendar, MessageCircle, Brain, CalendarDays, Bell } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' }) => {
@@ -29,14 +29,6 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
       tab: 'quiz'
     },
     {
-      id: 'stories',
-      label: 'Photo Stories',
-      description: 'Watch & listen to memories',
-      icon: Film,
-      color: 'bg-primary/20 border-primary hover:bg-primary/30',
-      tab: 'stories'
-    },
-    {
       id: 'week',
       label: 'My Week',
       description: 'What did I do recently?',
@@ -57,7 +49,7 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
       label: 'Today',
       description: 'Your daily reminders',
       icon: Bell,
-      color: 'bg-family-siblings/20 border-family-siblings hover:bg-family-siblings/30',
+      color: 'bg-primary/20 border-primary hover:bg-primary/30',
       tab: 'reminders'
     },
   ];
