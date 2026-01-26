@@ -1,8 +1,7 @@
-import React, { useState } from 'react';
-import { UserPlus, Upload, X, Phone, MapPin, Calendar, FileText, Mic, Loader2 } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { UserPlus, Upload, X, Phone, MapPin, Calendar, FileText, Mic, MicOff, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
@@ -29,11 +28,82 @@ const relationshipOptions = {
   other: ['Cousin', 'Aunt', 'Uncle', 'Niece', 'Nephew', 'Caregiver', 'Other'],
 };
 
+// Voice-to-text hook
+const useVoiceToText = () => {
+  const [isListening, setIsListening] = useState(false);
+  const [isSupported, setIsSupported] = useState(false);
+  const recognitionRef = useRef(null);
+  const onResultRef = useRef(null);
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    setIsSupported(!!SpeechRecognition);
+
+    if (SpeechRecognition) {
+      recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = true;
+      recognitionRef.current.interimResults = false;
+      recognitionRef.current.lang = 'en-US';
+
+      recognitionRef.current.onresult = (event) => {
+        let transcript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            transcript += event.results[i][0].transcript + ' ';
+          }
+        }
+        if (transcript && onResultRef.current) {
+          onResultRef.current(transcript);
+        }
+      };
+
+      recognitionRef.current.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+        setIsListening(false);
+        if (event.error === 'not-allowed') {
+          toast.error('Please allow microphone access to use voice input');
+        }
+      };
+
+      recognitionRef.current.onend = () => {
+        setIsListening(false);
+      };
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (e) {}
+      }
+    };
+  }, []);
+
+  const startListening = useCallback((onResult) => {
+    if (recognitionRef.current && !isListening) {
+      onResultRef.current = onResult;
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  }, [isListening]);
+
+  const stopListening = useCallback(() => {
+    if (recognitionRef.current && isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
+  }, [isListening]);
+
+  return { isListening, isSupported, startListening, stopListening };
+};
+
 export const AddFamilyForm = ({ onSuccess, onClose }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [uploadingVoice, setUploadingVoice] = useState(false);
+  
+  const { isListening, isSupported, startListening, stopListening } = useVoiceToText();
   
   const [formData, setFormData] = useState({
     name: '',
@@ -114,6 +184,21 @@ export const AddFamilyForm = ({ onSuccess, onClose }) => {
       ...prev,
       voice_notes: prev.voice_notes.filter((_, i) => i !== index)
     }));
+  };
+
+  // Voice input handler for notes
+  const handleVoiceInput = () => {
+    if (isListening) {
+      stopListening();
+    } else {
+      startListening((transcript) => {
+        setFormData(prev => ({
+          ...prev,
+          notes: prev.notes + transcript
+        }));
+      });
+      toast.info('Listening... speak now to add notes');
+    }
   };
 
   const handleSubmit = async (e) => {
@@ -297,10 +382,10 @@ export const AddFamilyForm = ({ onSuccess, onClose }) => {
         )}
       </div>
 
-      {/* Voice Notes */}
+      {/* Voice Notes Upload */}
       <div>
         <Label className="text-lg font-semibold flex items-center gap-2">
-          <Mic className="h-5 w-5" /> Voice Notes
+          <Mic className="h-5 w-5" /> Voice Notes (Upload Recording)
         </Label>
         <div className="mt-2">
           <input
@@ -347,19 +432,54 @@ export const AddFamilyForm = ({ onSuccess, onClose }) => {
         )}
       </div>
 
-      {/* Notes */}
+      {/* Notes with Voice-to-Text */}
       <div>
         <Label htmlFor="notes" className="text-lg font-semibold flex items-center gap-2">
           <FileText className="h-5 w-5" /> Special Notes
+          {isSupported && (
+            <span className="text-sm font-normal text-muted-foreground ml-2">
+              (tap mic to speak)
+            </span>
+          )}
         </Label>
-        <Textarea
-          id="notes"
-          name="notes"
-          value={formData.notes}
-          onChange={handleInputChange}
-          placeholder="Write anything special about this person - memories, favorite things, etc."
-          className="mt-2 min-h-[100px] text-lg"
-        />
+        <div className="mt-2 relative">
+          <textarea
+            id="notes"
+            name="notes"
+            value={formData.notes}
+            onChange={handleInputChange}
+            placeholder="Write anything special about this person - memories, favorite things, etc. You can also tap the microphone to speak."
+            className="w-full min-h-[100px] rounded-xl border-2 border-input bg-background px-4 py-3 text-lg focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 resize-none pr-16"
+          />
+          {isSupported && (
+            <Button
+              type="button"
+              variant={isListening ? "destructive" : "outline"}
+              size="icon"
+              onClick={handleVoiceInput}
+              className="absolute bottom-3 right-3 h-12 w-12"
+              title={isListening ? 'Stop recording' : 'Start voice input'}
+            >
+              {isListening ? (
+                <div className="relative">
+                  <MicOff className="h-6 w-6" />
+                  <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive-foreground opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-destructive-foreground"></span>
+                  </span>
+                </div>
+              ) : (
+                <Mic className="h-6 w-6" />
+              )}
+            </Button>
+          )}
+        </div>
+        {isListening && (
+          <p className="text-sm text-primary animate-pulse flex items-center gap-2 mt-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Listening... speak now to add notes
+          </p>
+        )}
       </div>
 
       {/* Submit */}
