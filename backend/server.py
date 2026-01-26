@@ -395,7 +395,8 @@ async def create_family_member(
     await db.family_members.insert_one(doc)
     
     # Return without embedding
-    del doc['embedding'] if 'embedding' in doc else None
+    if 'embedding' in doc:
+        del doc['embedding']
     return doc
 
 @api_router.put("/family/{member_id}", response_model=dict)
