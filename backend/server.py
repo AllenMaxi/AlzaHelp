@@ -653,6 +653,80 @@ async def reset_reminders(current_user: User = Depends(get_current_user)):
     )
     return {"message": "All reminders reset"}
 
+# ==================== DAILY NOTES ====================
+
+class DailyNote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: f"note_{uuid.uuid4().hex[:12]}")
+    user_id: str
+    date: str  # YYYY-MM-DD format
+    note: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class DailyNoteCreate(BaseModel):
+    date: str
+    note: str
+
+@api_router.get("/daily-notes", response_model=List[dict])
+async def get_daily_notes(current_user: User = Depends(get_current_user)):
+    """Get all daily notes for the current user (last 30 days)"""
+    notes = await db.daily_notes.find(
+        {"user_id": current_user.user_id},
+        {"_id": 0}
+    ).sort("date", -1).to_list(30)
+    return notes
+
+@api_router.post("/daily-notes", response_model=dict)
+async def create_daily_note(
+    note_data: DailyNoteCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Create or update a daily note"""
+    # Check if note already exists for this date
+    existing = await db.daily_notes.find_one(
+        {"user_id": current_user.user_id, "date": note_data.date},
+        {"_id": 0}
+    )
+    
+    if existing:
+        # Append to existing note
+        updated_note = existing['note'] + '\n\n' + note_data.note
+        await db.daily_notes.update_one(
+            {"id": existing['id']},
+            {"$set": {"note": updated_note, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        existing['note'] = updated_note
+        return existing
+    else:
+        # Create new note
+        note_obj = DailyNote(
+            user_id=current_user.user_id,
+            date=note_data.date,
+            note=note_data.note
+        )
+        doc = note_obj.model_dump()
+        doc['created_at'] = doc['created_at'].isoformat()
+        
+        await db.daily_notes.insert_one(doc)
+        
+        if '_id' in doc:
+            del doc['_id']
+        return doc
+
+@api_router.get("/daily-notes/{date}", response_model=dict)
+async def get_daily_note(
+    date: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get daily note for a specific date"""
+    note = await db.daily_notes.find_one(
+        {"user_id": current_user.user_id, "date": date},
+        {"_id": 0}
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
+
 # ==================== RAG CHAT ====================
 
 def keyword_match_score(query: str, text: str) -> float:
