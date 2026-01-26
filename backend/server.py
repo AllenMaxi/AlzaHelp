@@ -306,46 +306,91 @@ async def logout(request: Request, response: Response):
     response.delete_cookie(key="session_token", path="/")
     return {"message": "Logged out"}
 
-# ==================== FILE UPLOAD ====================
+# ==================== FILE UPLOAD (MongoDB GridFS) ====================
 
 @api_router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    """Upload a file (photo or voice note)"""
+    """Upload a file (photo or voice note) to MongoDB GridFS"""
+    # Read file content
+    content = await file.read()
+    
     # Generate unique filename
     ext = Path(file.filename).suffix if file.filename else ".jpg"
     filename = f"{current_user.user_id}_{uuid.uuid4().hex[:8]}{ext}"
-    filepath = UPLOAD_DIR / filename
     
-    # Save file
-    async with aiofiles.open(filepath, 'wb') as f:
-        content = await file.read()
-        await f.write(content)
+    # Determine content type
+    content_type = file.content_type or 'application/octet-stream'
     
-    # Return URL
-    return {"url": f"/uploads/{filename}", "filename": filename}
+    # Store in GridFS
+    file_id = await fs_bucket.upload_from_stream(
+        filename,
+        io.BytesIO(content),
+        metadata={
+            "user_id": current_user.user_id,
+            "content_type": content_type,
+            "original_filename": file.filename,
+            "uploaded_at": datetime.now(timezone.utc).isoformat()
+        }
+    )
+    
+    # Return URL to retrieve file
+    return {"url": f"/api/files/{filename}", "filename": filename, "file_id": str(file_id)}
 
 @api_router.post("/upload/multiple")
 async def upload_multiple_files(
     files: List[UploadFile] = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    """Upload multiple files"""
+    """Upload multiple files to MongoDB GridFS"""
     urls = []
     for file in files:
+        content = await file.read()
         ext = Path(file.filename).suffix if file.filename else ".jpg"
         filename = f"{current_user.user_id}_{uuid.uuid4().hex[:8]}{ext}"
-        filepath = UPLOAD_DIR / filename
+        content_type = file.content_type or 'application/octet-stream'
         
-        async with aiofiles.open(filepath, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
+        await fs_bucket.upload_from_stream(
+            filename,
+            io.BytesIO(content),
+            metadata={
+                "user_id": current_user.user_id,
+                "content_type": content_type,
+                "original_filename": file.filename,
+                "uploaded_at": datetime.now(timezone.utc).isoformat()
+            }
+        )
         
-        urls.append(f"/uploads/{filename}")
+        urls.append(f"/api/files/{filename}")
     
     return {"urls": urls}
+
+@api_router.get("/files/{filename}")
+async def get_file(filename: str):
+    """Retrieve a file from MongoDB GridFS"""
+    try:
+        # Find file in GridFS
+        grid_out = await fs_bucket.open_download_stream_by_name(filename)
+        
+        # Read content
+        content = await grid_out.read()
+        
+        # Get content type from metadata
+        content_type = grid_out.metadata.get('content_type', 'application/octet-stream') if grid_out.metadata else 'application/octet-stream'
+        
+        return StreamingResponse(
+            io.BytesIO(content),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f"inline; filename={filename}",
+                "Cache-Control": "public, max-age=31536000"  # Cache for 1 year
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error retrieving file {filename}: {e}")
+        raise HTTPException(status_code=404, detail="File not found")
 
 # ==================== FAMILY MEMBERS ====================
 
