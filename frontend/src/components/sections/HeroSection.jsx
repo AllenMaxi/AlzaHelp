@@ -52,6 +52,14 @@ export const HeroSection = ({ setCurrentView, setActiveTab, userName = 'Friend' 
       color: 'bg-success/20 border-success hover:bg-success/30',
       tab: 'assistant'
     },
+    {
+      id: 'today',
+      label: 'Today',
+      description: 'Your daily reminders',
+      icon: Bell,
+      color: 'bg-family-siblings/20 border-family-siblings hover:bg-family-siblings/30',
+      tab: 'reminders'
+    },
   ];
 
   const handleQuickAction = (tab) => {
