@@ -40,6 +40,48 @@ export const TimelineSection = ({ memories = [], familyMembers = [], onRefresh, 
   const [filter, setFilter] = useState('all');
   const [showAddForm, setShowAddForm] = useState(false);
   const [deleting, setDeleting] = useState(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+
+  // Voice narration for "Tell My Story"
+  const speak = useCallback((text, onEnd) => {
+    if (!voiceEnabled || !('speechSynthesis' in window)) {
+      if (onEnd) onEnd();
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.75;
+    utterance.pitch = 1;
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    utterance.onerror = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    window.speechSynthesis.speak(utterance);
+  }, [voiceEnabled]);
+
+  const stopSpeaking = useCallback(() => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+  }, []);
+
+  const tellMyStory = (memory) => {
+    const peopleStr = memory.people?.length > 0 
+      ? `The people in this memory are: ${memory.people.join(', ')}.` 
+      : '';
+    const locationStr = memory.location ? `This was at ${memory.location}.` : '';
+    
+    const narration = `${memory.title}. ${memory.date}. ${locationStr} ${memory.description} ${peopleStr}`;
+    speak(narration);
+    toast.success('Playing your memory story...');
+  };
 
   const filteredMemories = filter === 'all' 
     ? memories 
