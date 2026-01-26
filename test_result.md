@@ -102,7 +102,7 @@
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
 
-user_problem_statement: "Test the MemoryKeeper application for Alzheimer's patients at https://alzahelper.preview.emergentagent.com"
+user_problem_statement: "Test the MemoryKeeper application for Alzheimer's patients at https://recall-buddy-43.preview.emergentagent.com"
 
 frontend:
   - task: "Login page with Google OAuth button"
