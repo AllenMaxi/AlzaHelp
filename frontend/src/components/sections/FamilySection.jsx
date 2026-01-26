@@ -1,114 +1,84 @@
 import React, { useState } from 'react';
-import { Heart, Phone, MapPin, Calendar, ChevronRight, X } from 'lucide-react';
+import { Heart, Phone, MapPin, Calendar, ChevronRight, X, UserPlus, Trash2, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
-
-// Mock family data
-const familyMembers = [
-  {
-    id: 1,
-    name: 'Maria',
-    relationship: 'Spouse',
-    relationshipLabel: 'Your Wife',
-    photo: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 123-4567',
-    address: '123 Oak Street, Hometown',
-    birthday: 'March 15',
-    yearsMarried: 52,
-    favoriteMemory: 'Your wedding day in 1972 at the little church on Maple Avenue. Maria wore her mother\'s wedding dress.',
-    category: 'spouse',
-    color: 'border-family-spouse bg-family-spouse/10'
-  },
-  {
-    id: 2,
-    name: 'Michael',
-    relationship: 'Son',
-    relationshipLabel: 'Your Son',
-    photo: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 234-5678',
-    address: '456 Pine Road, Nearby City',
-    birthday: 'July 22',
-    favoriteMemory: 'Teaching him to ride a bike in the backyard when he was 6. He fell many times but never gave up!',
-    category: 'children',
-    color: 'border-family-children bg-family-children/10'
-  },
-  {
-    id: 3,
-    name: 'Sarah',
-    relationship: 'Daughter',
-    relationshipLabel: 'Your Daughter',
-    photo: 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 345-6789',
-    address: '789 Elm Avenue, Sunny Town',
-    birthday: 'November 8',
-    favoriteMemory: 'Her graduation day from medical school. You were so proud, you cried happy tears.',
-    category: 'children',
-    color: 'border-family-children bg-family-children/10'
-  },
-  {
-    id: 4,
-    name: 'Emma',
-    relationship: 'Granddaughter',
-    relationshipLabel: 'Your Granddaughter',
-    photo: 'https://images.unsplash.com/photo-1489424731084-a5d8b219a5bb?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 456-7890',
-    address: 'Lives with Michael',
-    birthday: 'April 3',
-    age: 12,
-    favoriteMemory: 'She loves baking cookies with you every Christmas. Her favorite are your chocolate chip cookies.',
-    category: 'grandchildren',
-    color: 'border-family-grandchildren bg-family-grandchildren/10'
-  },
-  {
-    id: 5,
-    name: 'James',
-    relationship: 'Grandson',
-    relationshipLabel: 'Your Grandson',
-    photo: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 567-8901',
-    address: 'Lives with Sarah',
-    birthday: 'September 17',
-    age: 8,
-    favoriteMemory: 'He calls you "Papa Bear" because you always give the best bear hugs. He loves fishing with you.',
-    category: 'grandchildren',
-    color: 'border-family-grandchildren bg-family-grandchildren/10'
-  },
-  {
-    id: 6,
-    name: 'Lily',
-    relationship: 'Granddaughter',
-    relationshipLabel: 'Your Granddaughter',
-    photo: 'https://images.unsplash.com/photo-1517841905240-472988babdf9?w=400&h=400&fit=crop&crop=face',
-    phone: '(555) 678-9012',
-    address: 'Lives with Sarah',
-    birthday: 'February 28',
-    age: 5,
-    favoriteMemory: 'The youngest! She loves when you read her bedtime stories, especially "The Little Prince".',
-    category: 'grandchildren',
-    color: 'border-family-grandchildren bg-family-grandchildren/10'
-  },
-];
+import { AddFamilyForm } from '@/components/forms/AddFamilyForm';
+import { familyApi } from '@/services/api';
+import { toast } from 'sonner';
 
 const categoryLabels = {
   spouse: { label: 'My Spouse', color: 'bg-family-spouse text-white' },
   children: { label: 'My Children', color: 'bg-family-children text-white' },
   grandchildren: { label: 'My Grandchildren', color: 'bg-family-grandchildren text-foreground' },
+  siblings: { label: 'My Siblings', color: 'bg-primary text-primary-foreground' },
+  parents: { label: 'My Parents', color: 'bg-accent text-accent-foreground' },
+  friends: { label: 'My Friends', color: 'bg-success text-success-foreground' },
+  other: { label: 'Other Family', color: 'bg-muted text-muted-foreground' },
 };
 
-export const FamilySection = () => {
+const categoryColors = {
+  spouse: 'border-family-spouse bg-family-spouse/10',
+  children: 'border-family-children bg-family-children/10',
+  grandchildren: 'border-family-grandchildren bg-family-grandchildren/10',
+  siblings: 'border-primary bg-primary/10',
+  parents: 'border-accent bg-accent/10',
+  friends: 'border-success bg-success/10',
+  other: 'border-muted bg-muted/50',
+};
+
+// Placeholder images for family members without photos
+const placeholderImages = {
+  spouse: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400&h=400&fit=crop&crop=face',
+  children: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&h=400&fit=crop&crop=face',
+  grandchildren: 'https://images.unsplash.com/photo-1489424731084-a5d8b219a5bb?w=400&h=400&fit=crop&crop=face',
+  siblings: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=400&h=400&fit=crop&crop=face',
+  parents: 'https://images.unsplash.com/photo-1547425260-76bcadfb4f2c?w=400&h=400&fit=crop&crop=face',
+  friends: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=400&h=400&fit=crop&crop=face',
+  other: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=400&h=400&fit=crop&crop=face',
+};
+
+export const FamilySection = ({ familyMembers = [], onRefresh, loading }) => {
   const [selectedMember, setSelectedMember] = useState(null);
   const [filter, setFilter] = useState('all');
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [deleting, setDeleting] = useState(null);
 
   const filteredMembers = filter === 'all' 
     ? familyMembers 
     : familyMembers.filter(m => m.category === filter);
 
-  const groupedMembers = {
-    spouse: filteredMembers.filter(m => m.category === 'spouse'),
-    children: filteredMembers.filter(m => m.category === 'children'),
-    grandchildren: filteredMembers.filter(m => m.category === 'grandchildren'),
+  // Group members by category
+  const groupedMembers = {};
+  filteredMembers.forEach(member => {
+    if (!groupedMembers[member.category]) {
+      groupedMembers[member.category] = [];
+    }
+    groupedMembers[member.category].push(member);
+  });
+
+  const handleDelete = async (memberId, memberName) => {
+    if (!window.confirm(`Are you sure you want to remove ${memberName}?`)) return;
+    
+    setDeleting(memberId);
+    try {
+      await familyApi.delete(memberId);
+      toast.success(`${memberName} has been removed`);
+      setSelectedMember(null);
+      onRefresh();
+    } catch (error) {
+      toast.error('Failed to remove family member');
+    } finally {
+      setDeleting(null);
+    }
+  };
+
+  const getPhoto = (member) => {
+    if (member.photos && member.photos.length > 0) {
+      return member.photos[0];
+    }
+    return placeholderImages[member.category] || placeholderImages.other;
   };
 
   return (
@@ -128,8 +98,19 @@ export const FamilySection = () => {
           </p>
         </div>
 
-        {/* Filter buttons */}
+        {/* Add button and Filter buttons */}
         <div className="flex flex-wrap justify-center gap-3 mb-10">
+          <Button
+            variant="accessible"
+            onClick={() => setShowAddForm(true)}
+            className="gap-2"
+          >
+            <UserPlus className="h-5 w-5" />
+            Add Family Member
+          </Button>
+          
+          <div className="w-full sm:w-auto" />
+          
           <Button
             variant={filter === 'all' ? 'accessible' : 'accessible-outline'}
             onClick={() => setFilter('all')}
@@ -139,30 +120,49 @@ export const FamilySection = () => {
           <Button
             variant={filter === 'spouse' ? 'accessible' : 'accessible-outline'}
             onClick={() => setFilter('spouse')}
-            className={filter === 'spouse' ? 'bg-family-spouse hover:bg-family-spouse/90' : ''}
           >
-            My Spouse
+            Spouse
           </Button>
           <Button
             variant={filter === 'children' ? 'accessible' : 'accessible-outline'}
             onClick={() => setFilter('children')}
-            className={filter === 'children' ? 'bg-family-children hover:bg-family-children/90' : ''}
           >
-            My Children
+            Children
           </Button>
           <Button
             variant={filter === 'grandchildren' ? 'accessible' : 'accessible-outline'}
             onClick={() => setFilter('grandchildren')}
-            className={filter === 'grandchildren' ? 'bg-family-grandchildren hover:bg-family-grandchildren/90 text-foreground' : ''}
           >
-            My Grandchildren
+            Grandchildren
           </Button>
         </div>
 
+        {/* Loading state */}
+        {loading && (
+          <div className="flex justify-center py-12">
+            <Loader2 className="h-8 w-8 animate-spin text-primary" />
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!loading && familyMembers.length === 0 && (
+          <div className="text-center py-12">
+            <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-muted flex items-center justify-center">
+              <Heart className="h-10 w-10 text-muted-foreground" />
+            </div>
+            <h3 className="text-xl font-semibold mb-2">No family members yet</h3>
+            <p className="text-muted-foreground mb-6">Add your first family member to get started</p>
+            <Button variant="accessible" onClick={() => setShowAddForm(true)}>
+              <UserPlus className="h-5 w-5 mr-2" />
+              Add Family Member
+            </Button>
+          </div>
+        )}
+
         {/* Family members by category */}
-        {Object.entries(groupedMembers).map(([category, members]) => {
+        {!loading && Object.entries(groupedMembers).map(([category, members]) => {
           if (members.length === 0) return null;
-          const categoryInfo = categoryLabels[category];
+          const categoryInfo = categoryLabels[category] || categoryLabels.other;
           
           return (
             <div key={category} className="mb-12">
@@ -177,7 +177,7 @@ export const FamilySection = () => {
                 {members.map((member, index) => (
                   <Card
                     key={member.id}
-                    className={`group cursor-pointer border-2 ${member.color} shadow-card hover:shadow-elevated transition-all duration-300 hover:-translate-y-1 animate-scale-in overflow-hidden`}
+                    className={`group cursor-pointer border-2 ${categoryColors[member.category] || categoryColors.other} shadow-card hover:shadow-elevated transition-all duration-300 hover:-translate-y-1 animate-scale-in overflow-hidden`}
                     style={{ animationDelay: `${index * 0.1}s` }}
                     onClick={() => setSelectedMember(member)}
                   >
@@ -185,7 +185,7 @@ export const FamilySection = () => {
                       {/* Photo */}
                       <div className="relative h-48 sm:h-56 overflow-hidden">
                         <img
-                          src={member.photo}
+                          src={getPhoto(member)}
                           alt={member.name}
                           className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                         />
@@ -195,12 +195,14 @@ export const FamilySection = () => {
                       {/* Info */}
                       <div className="p-6">
                         <h3 className="text-2xl font-bold text-foreground mb-1">{member.name}</h3>
-                        <p className="text-lg text-primary font-medium mb-3">{member.relationshipLabel}</p>
+                        <p className="text-lg text-primary font-medium mb-3">{member.relationship_label}</p>
                         
-                        <div className="flex items-center gap-2 text-muted-foreground mb-4">
-                          <Calendar className="h-5 w-5" />
-                          <span className="text-base">Birthday: {member.birthday}</span>
-                        </div>
+                        {member.birthday && (
+                          <div className="flex items-center gap-2 text-muted-foreground mb-4">
+                            <Calendar className="h-5 w-5" />
+                            <span className="text-base">Birthday: {member.birthday}</span>
+                          </div>
+                        )}
                         
                         <Button variant="outline" className="w-full gap-2 group-hover:bg-primary group-hover:text-primary-foreground">
                           <span>Learn More</span>
@@ -215,6 +217,25 @@ export const FamilySection = () => {
           );
         })}
 
+        {/* Add Form Dialog */}
+        <Dialog open={showAddForm} onOpenChange={setShowAddForm}>
+          <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle className="text-2xl font-display flex items-center gap-2">
+                <UserPlus className="h-6 w-6 text-primary" />
+                Add Family Member
+              </DialogTitle>
+            </DialogHeader>
+            <AddFamilyForm 
+              onSuccess={() => {
+                setShowAddForm(false);
+                onRefresh();
+              }}
+              onClose={() => setShowAddForm(false)}
+            />
+          </DialogContent>
+        </Dialog>
+
         {/* Detail Dialog */}
         <Dialog open={!!selectedMember} onOpenChange={() => setSelectedMember(null)}>
           <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
@@ -222,64 +243,110 @@ export const FamilySection = () => {
               <>
                 <DialogHeader>
                   <DialogTitle className="text-3xl font-display">{selectedMember.name}</DialogTitle>
-                  <DialogDescription className="text-xl text-primary font-medium">
-                    {selectedMember.relationshipLabel}
-                  </DialogDescription>
+                  <p className="text-xl text-primary font-medium">
+                    {selectedMember.relationship_label}
+                  </p>
                 </DialogHeader>
                 
                 <div className="mt-6 space-y-6">
                   {/* Large Photo */}
                   <div className="relative rounded-2xl overflow-hidden shadow-card">
                     <img
-                      src={selectedMember.photo}
+                      src={getPhoto(selectedMember)}
                       alt={selectedMember.name}
                       className="w-full h-64 sm:h-80 object-cover"
                     />
                   </div>
                   
+                  {/* Multiple photos gallery */}
+                  {selectedMember.photos && selectedMember.photos.length > 1 && (
+                    <div className="flex gap-2 overflow-x-auto pb-2">
+                      {selectedMember.photos.map((photo, idx) => (
+                        <img
+                          key={idx}
+                          src={photo}
+                          alt={`${selectedMember.name} photo ${idx + 1}`}
+                          className="h-20 w-20 object-cover rounded-lg flex-shrink-0"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  
                   {/* Details */}
                   <div className="space-y-4">
-                    <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
-                      <Calendar className="h-6 w-6 text-primary mt-1" />
-                      <div>
-                        <p className="font-semibold text-lg">Birthday</p>
-                        <p className="text-accessible text-muted-foreground">{selectedMember.birthday}</p>
+                    {selectedMember.birthday && (
+                      <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
+                        <Calendar className="h-6 w-6 text-primary mt-1" />
+                        <div>
+                          <p className="font-semibold text-lg">Birthday</p>
+                          <p className="text-accessible text-muted-foreground">{selectedMember.birthday}</p>
+                        </div>
                       </div>
-                    </div>
+                    )}
                     
-                    <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
-                      <Phone className="h-6 w-6 text-primary mt-1" />
-                      <div>
-                        <p className="font-semibold text-lg">Phone Number</p>
-                        <p className="text-accessible text-muted-foreground">{selectedMember.phone}</p>
+                    {selectedMember.phone && (
+                      <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
+                        <Phone className="h-6 w-6 text-primary mt-1" />
+                        <div>
+                          <p className="font-semibold text-lg">Phone Number</p>
+                          <p className="text-accessible text-muted-foreground">{selectedMember.phone}</p>
+                        </div>
                       </div>
-                    </div>
+                    )}
                     
-                    <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
-                      <MapPin className="h-6 w-6 text-primary mt-1" />
-                      <div>
-                        <p className="font-semibold text-lg">Address</p>
-                        <p className="text-accessible text-muted-foreground">{selectedMember.address}</p>
+                    {selectedMember.address && (
+                      <div className="flex items-start gap-4 p-4 rounded-xl bg-muted">
+                        <MapPin className="h-6 w-6 text-primary mt-1" />
+                        <div>
+                          <p className="font-semibold text-lg">Address</p>
+                          <p className="text-accessible text-muted-foreground">{selectedMember.address}</p>
+                        </div>
                       </div>
-                    </div>
+                    )}
                     
-                    <div className="flex items-start gap-4 p-4 rounded-xl bg-primary/10 border-2 border-primary">
-                      <Heart className="h-6 w-6 text-primary mt-1" fill="currentColor" />
-                      <div>
-                        <p className="font-semibold text-lg text-primary">A Special Memory</p>
-                        <p className="text-accessible text-foreground mt-2">{selectedMember.favoriteMemory}</p>
+                    {selectedMember.notes && (
+                      <div className="flex items-start gap-4 p-4 rounded-xl bg-primary/10 border-2 border-primary">
+                        <Heart className="h-6 w-6 text-primary mt-1" fill="currentColor" />
+                        <div>
+                          <p className="font-semibold text-lg text-primary">Special Notes</p>
+                          <p className="text-accessible text-foreground mt-2">{selectedMember.notes}</p>
+                        </div>
                       </div>
-                    </div>
+                    )}
+                    
+                    {/* Voice notes */}
+                    {selectedMember.voice_notes && selectedMember.voice_notes.length > 0 && (
+                      <div className="space-y-2">
+                        <p className="font-semibold text-lg">Voice Notes</p>
+                        {selectedMember.voice_notes.map((url, idx) => (
+                          <audio key={idx} src={url} controls className="w-full" />
+                        ))}
+                      </div>
+                    )}
                   </div>
                   
-                  <Button 
-                    variant="accessible" 
-                    className="w-full"
-                    onClick={() => setSelectedMember(null)}
-                  >
-                    <X className="h-6 w-6 mr-2" />
-                    Close
-                  </Button>
+                  <div className="flex gap-4">
+                    <Button 
+                      variant="accessible" 
+                      className="flex-1"
+                      onClick={() => setSelectedMember(null)}
+                    >
+                      <X className="h-6 w-6 mr-2" />
+                      Close
+                    </Button>
+                    <Button 
+                      variant="destructive"
+                      className="gap-2"
+                      onClick={() => handleDelete(selectedMember.id, selectedMember.name)}
+                      disabled={deleting === selectedMember.id}
+                    >
+                      {deleting === selectedMember.id ? (
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-5 w-5" />
+                      )}
+                    </Button>
+                  </div>
                 </div>
               </>
             )}
