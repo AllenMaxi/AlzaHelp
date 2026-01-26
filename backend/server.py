@@ -594,6 +594,10 @@ async def create_reminder(
     doc['created_at'] = doc['created_at'].isoformat()
     
     await db.reminders.insert_one(doc)
+    
+    # Return without _id
+    if '_id' in doc:
+        del doc['_id']
     return doc
 
 @api_router.put("/reminders/{reminder_id}/toggle")
