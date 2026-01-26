@@ -75,7 +75,6 @@ export const DashboardPage = () => {
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
     { id: 'quiz', label: 'Quiz', icon: Brain },
-    { id: 'stories', label: 'Stories', icon: Film },
     { id: 'week', label: 'My Week', icon: CalendarDays },
     { id: 'assistant', label: 'Ask Me', icon: MessageCircle },
     { id: 'reminders', label: 'Today', icon: Bell },
