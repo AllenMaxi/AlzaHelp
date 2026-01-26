@@ -13,8 +13,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 import aiofiles
 import json
-from openai import AsyncOpenAI
-import numpy as np
+import re
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -23,9 +22,6 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
-
-# OpenAI client for embeddings
-openai_client = AsyncOpenAI(api_key=os.environ.get('EMERGENT_LLM_KEY', ''))
 
 # Create uploads directory if not exists
 UPLOAD_DIR = ROOT_DIR / "uploads"
