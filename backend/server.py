@@ -377,22 +377,14 @@ async def create_family_member(
     doc['created_at'] = doc['created_at'].isoformat()
     doc['updated_at'] = doc['updated_at'].isoformat()
     
-    # Generate embedding for RAG
-    text_for_embedding = f"{member.name} {member.relationship} {member.relationship_label} {member.notes or ''}"
-    try:
-        embedding_response = await openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text_for_embedding
-        )
-        doc['embedding'] = embedding_response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Error creating embedding: {e}")
+    # Store searchable text for keyword search
+    doc['search_text'] = f"{member.name} {member.relationship} {member.relationship_label} {member.notes or ''}".lower()
     
     await db.family_members.insert_one(doc)
     
-    # Return without embedding and _id
-    if 'embedding' in doc:
-        del doc['embedding']
+    # Return without search_text and _id
+    if 'search_text' in doc:
+        del doc['search_text']
     if '_id' in doc:
         del doc['_id']
     return doc
