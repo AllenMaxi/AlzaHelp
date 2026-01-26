@@ -225,6 +225,42 @@ frontend:
         agent: "testing"
         comment: "✅ PASSED: Dark mode toggle button found in header and functional. Toggle switches between light and dark themes successfully."
 
+  - task: "Voice-to-text in Add Memory form description field"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/src/components/forms/AddMemoryForm.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "testing"
+        comment: "Need to test microphone button appears next to description field and '(tap mic to speak)' hint is shown"
+
+  - task: "Voice-to-text in Add Family form notes field"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/src/components/forms/AddFamilyForm.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "testing"
+        comment: "Need to test microphone button appears next to notes field and '(tap mic to speak)' hint is shown"
+
+  - task: "File uploads stored in MongoDB GridFS - images display correctly"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/src/components/sections/TimelineSection.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "testing"
+        comment: "Need to test that existing images load correctly, particularly the wedding memory thumbnail"
+
 metadata:
   created_by: "testing_agent"
   version: "1.0"
