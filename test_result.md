@@ -281,3 +281,5 @@ agent_communication:
     message: "Starting comprehensive testing of MemoryKeeper application. Will test login page, authenticated dashboard sections, and all key features as specified in review request."
   - agent: "testing"
     message: "✅ TESTING COMPLETE: All 8 core features tested and working successfully. Login page shows Google OAuth button, authentication works with Margaret Smith, family section shows John/Sarah/Emma, memory timeline functional, AI chat working with quick questions, reminders system operational, buttons are accessible (≥40px), and dark mode toggle works. Application is fully functional for Alzheimer's patients with large, accessible UI elements."
+  - agent: "testing"
+    message: "Starting testing of updated features: Voice-to-text functionality in Add Memory and Add Family forms, and verifying file uploads display correctly from MongoDB GridFS."
