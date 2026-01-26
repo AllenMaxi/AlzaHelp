@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Calendar, MapPin, Users, Heart, ChevronLeft, ChevronRight, X, ZoomIn, Plus, Trash2, Loader2 } from 'lucide-react';
+import React, { useState, useCallback } from 'react';
+import { Calendar, MapPin, Users, Heart, ChevronLeft, ChevronRight, X, ZoomIn, Plus, Trash2, Loader2, Volume2, VolumeX, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
