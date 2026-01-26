@@ -268,7 +268,10 @@ metadata:
   run_ui: true
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Voice-to-text in Add Memory form description field"
+    - "Voice-to-text in Add Family form notes field"
+    - "File uploads stored in MongoDB GridFS - images display correctly"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
