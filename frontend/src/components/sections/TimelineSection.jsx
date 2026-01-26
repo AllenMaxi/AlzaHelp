@@ -356,6 +356,42 @@ export const TimelineSection = ({ memories = [], familyMembers = [], onRefresh, 
                         <p className="text-accessible text-foreground mt-2">{selectedMemory.description}</p>
                       </div>
                     </div>
+                    
+                    {/* Tell My Story - AI Narration Button */}
+                    <div className="flex items-center gap-3 p-4 rounded-xl bg-accent/20 border-2 border-accent">
+                      <Button
+                        variant="accessible"
+                        size="lg"
+                        className="flex-1 gap-3 text-lg"
+                        onClick={() => isSpeaking ? stopSpeaking() : tellMyStory(selectedMemory)}
+                      >
+                        {isSpeaking ? (
+                          <>
+                            <VolumeX className="h-6 w-6" />
+                            Stop Story
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="h-6 w-6" />
+                            Tell My Story
+                          </>
+                        )}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        onClick={() => setVoiceEnabled(!voiceEnabled)}
+                        className="h-12 w-12 shrink-0"
+                      >
+                        {voiceEnabled ? <Volume2 className="h-5 w-5" /> : <VolumeX className="h-5 w-5" />}
+                      </Button>
+                    </div>
+                    {isSpeaking && (
+                      <div className="flex items-center justify-center gap-2 p-3 rounded-lg bg-primary/10 animate-pulse">
+                        <Volume2 className="h-5 w-5 text-primary" />
+                        <span className="text-primary font-medium">Narrating your memory...</span>
+                      </div>
+                    )}
                   </div>
                   
                   {/* Navigation */}
