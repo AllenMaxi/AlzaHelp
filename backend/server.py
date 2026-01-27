@@ -904,6 +904,146 @@ async def get_chat_history(
     ).sort("timestamp", 1).to_list(100)
     return messages
 
+# ==================== VOICE ASSISTANT ====================
+
+class VoiceCommand(BaseModel):
+    text: str
+    session_id: str
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "nova"  # Warm, friendly voice good for elderly
+
+@api_router.post("/tts")
+async def text_to_speech(
+    request: TTSRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Convert text to speech using OpenAI TTS"""
+    from emergentintegrations.llm.openai import OpenAITextToSpeech
+    
+    try:
+        tts = OpenAITextToSpeech(api_key=os.environ.get('EMERGENT_LLM_KEY', ''))
+        
+        # Generate speech - use tts-1 for faster response
+        audio_base64 = await tts.generate_speech_base64(
+            text=request.text[:4000],  # Limit to 4000 chars
+            model="tts-1",
+            voice=request.voice,
+            speed=0.9  # Slightly slower for elderly users
+        )
+        
+        return {"audio": audio_base64, "format": "mp3"}
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate speech")
+
+@api_router.post("/voice-command")
+async def process_voice_command(
+    command: VoiceCommand,
+    current_user: User = Depends(get_current_user)
+):
+    """Process voice command and return action + response"""
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    
+    text = command.text.lower().strip()
+    
+    # Define navigation commands
+    nav_commands = {
+        "family": ["family", "loved ones", "relatives", "my family", "show family", "go to family"],
+        "timeline": ["memories", "memory", "timeline", "my memories", "show memories", "remember"],
+        "quiz": ["quiz", "game", "memory game", "practice", "play", "who is this"],
+        "week": ["week", "my week", "yesterday", "today activities", "what did i do", "recent"],
+        "assistant": ["ask", "help", "assistant", "chat", "talk"],
+        "reminders": ["reminders", "today", "tasks", "schedule", "medications"],
+        "home": ["home", "main", "start", "beginning"]
+    }
+    
+    # Check for navigation commands
+    for nav_target, keywords in nav_commands.items():
+        for keyword in keywords:
+            if keyword in text:
+                # Generate friendly response
+                responses = {
+                    "family": "Taking you to see your family now.",
+                    "timeline": "Let's look at your memories together.",
+                    "quiz": "Great! Let's play the memory game to practice remembering faces.",
+                    "week": "Let me show you what you did this week.",
+                    "assistant": "I'm here to help. What would you like to know?",
+                    "reminders": "Here are your reminders for today.",
+                    "home": "Taking you back home."
+                }
+                return {
+                    "action": "navigate",
+                    "target": nav_target,
+                    "response": responses.get(nav_target, f"Going to {nav_target}.")
+                }
+    
+    # Check for creation commands
+    if any(word in text for word in ["add", "create", "new", "remember this"]):
+        if "memory" in text or "remember" in text:
+            return {
+                "action": "create_memory",
+                "response": "I'll help you add a new memory. What would you like to remember?"
+            }
+        elif "reminder" in text:
+            return {
+                "action": "create_reminder", 
+                "response": "I'll help you set a reminder. What should I remind you about?"
+            }
+        elif "family" in text or "person" in text:
+            return {
+                "action": "create_family",
+                "response": "I'll help you add a family member. Who would you like to add?"
+            }
+    
+    # For questions, use the RAG chat system
+    context = await search_similar_content(current_user.user_id, text)
+    
+    context_parts = []
+    if context['family']:
+        context_parts.append("FAMILY MEMBERS:")
+        for fam in context['family']:
+            info = f"- {fam['name']} ({fam['relationship_label']})"
+            if fam.get('notes'):
+                info += f": {fam['notes']}"
+            context_parts.append(info)
+    
+    if context['memories']:
+        context_parts.append("\nMEMORIES:")
+        for mem in context['memories']:
+            info = f"- {mem['title']} ({mem['date']}): {mem['description']}"
+            context_parts.append(info)
+    
+    context_str = "\n".join(context_parts) if context_parts else "No specific information found."
+    
+    system_message = f"""You are a warm, caring voice assistant helping {current_user.name} who has memory challenges.
+Keep responses SHORT (2-3 sentences max) and speak naturally as if talking to them.
+
+User's information:
+{context_str}
+
+Guidelines:
+- Be warm, patient, and reassuring
+- Use simple, clear language
+- If you find information, share it naturally
+- If you don't know, say so kindly
+- Address them by name occasionally"""
+
+    chat = LlmChat(
+        api_key=os.environ.get('EMERGENT_LLM_KEY', ''),
+        session_id=f"voice_{current_user.user_id}_{command.session_id}",
+        system_message=system_message
+    ).with_model("openai", "gpt-4.1")
+    
+    user_message = UserMessage(text=command.text)
+    response = await chat.send_message(user_message)
+    
+    return {
+        "action": "speak",
+        "response": response
+    }
+
 # ==================== LEGACY ROUTES ====================
 
 @api_router.get("/")
