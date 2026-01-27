@@ -72,6 +72,16 @@ export const DashboardPage = () => {
     setReminders(data);
   };
 
+  // Voice assistant navigation handler
+  const handleVoiceNavigate = useCallback((target) => {
+    if (target === 'home') {
+      setCurrentView('home');
+    } else {
+      setCurrentView('memories');
+      setActiveTab(target);
+    }
+  }, []);
+
   const tabItems = [
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
@@ -89,6 +99,12 @@ export const DashboardPage = () => {
         darkMode={darkMode}
         setDarkMode={setDarkMode}
         user={user}
+      />
+      
+      {/* Voice Assistant Widget - Always visible */}
+      <VoiceAssistant 
+        onNavigate={handleVoiceNavigate}
+        userName={user?.name?.split(' ')[0] || 'Friend'}
       />
       
       {currentView === 'home' && (
