@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { Header } from "@/components/layout/Header";
 import { HeroSection } from "@/components/sections/HeroSection";
@@ -8,6 +8,7 @@ import { AssistantSection } from "@/components/sections/AssistantSection";
 import { RemindersSection } from "@/components/sections/RemindersSection";
 import { WhoIsThisQuiz } from "@/components/sections/WhoIsThisQuiz";
 import { WeekMemories } from "@/components/sections/WeekMemories";
+import { VoiceAssistant } from "@/components/VoiceAssistant";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Users, Calendar, MessageCircle, Bell, Heart, Brain, CalendarDays } from "lucide-react";
 import { familyApi, memoriesApi, remindersApi } from "@/services/api";
