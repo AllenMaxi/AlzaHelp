@@ -9,7 +9,7 @@ import { RemindersSection } from "@/components/sections/RemindersSection";
 import { WhoIsThisQuiz } from "@/components/sections/WhoIsThisQuiz";
 import { WeekMemories } from "@/components/sections/WeekMemories";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Users, Calendar, MessageCircle, Bell, Brain, CalendarDays, Home } from "lucide-react";
+import { Users, Calendar, MessageCircle, Bell, Brain, CalendarDays, Home, Heart } from "lucide-react";
 import { familyApi, memoriesApi, remindersApi } from "@/services/api";
 
 export const DashboardPage = () => {
