@@ -1,16 +1,15 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { Header } from "@/components/layout/Header";
-import { HeroSection } from "@/components/sections/HeroSection";
+import { AICompanion } from "@/components/AICompanion";
 import { FamilySection } from "@/components/sections/FamilySection";
 import { TimelineSection } from "@/components/sections/TimelineSection";
 import { AssistantSection } from "@/components/sections/AssistantSection";
 import { RemindersSection } from "@/components/sections/RemindersSection";
 import { WhoIsThisQuiz } from "@/components/sections/WhoIsThisQuiz";
 import { WeekMemories } from "@/components/sections/WeekMemories";
-import { VoiceAssistant } from "@/components/VoiceAssistant";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Users, Calendar, MessageCircle, Bell, Heart, Brain, CalendarDays } from "lucide-react";
+import { Users, Calendar, MessageCircle, Bell, Brain, CalendarDays, Home } from "lucide-react";
 import { familyApi, memoriesApi, remindersApi } from "@/services/api";
 
 export const DashboardPage = () => {
