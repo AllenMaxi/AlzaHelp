@@ -131,6 +131,14 @@ export const DashboardPage = () => {
             <div className="sticky top-20 z-40 bg-background/95 backdrop-blur border-b border-border">
               <div className="container mx-auto px-4 sm:px-6 lg:px-8">
                 <TabsList className="h-auto p-2 bg-muted/50 rounded-2xl my-4 flex flex-wrap justify-center gap-2">
+                  {/* Home button to return to AI Companion */}
+                  <button
+                    onClick={() => setCurrentView('home')}
+                    className="flex items-center gap-2 py-3 px-4 text-base font-semibold rounded-xl bg-accent text-accent-foreground hover:bg-accent/80 transition-all duration-300"
+                  >
+                    <Home className="h-5 w-5" />
+                    <span className="hidden sm:inline">Assistant</span>
+                  </button>
                   {tabItems.map((tab) => {
                     const Icon = tab.icon;
                     return (
