@@ -100,17 +100,11 @@ export const DashboardPage = () => {
         user={user}
       />
       
-      {/* Voice Assistant Widget - Always visible */}
-      <VoiceAssistant 
-        onNavigate={handleVoiceNavigate}
-        userName={user?.name?.split(' ')[0] || 'Friend'}
-      />
-      
       {currentView === 'home' && (
-        <HeroSection 
-          setCurrentView={setCurrentView}
-          setActiveTab={setActiveTab}
+        <AICompanion 
+          onNavigate={handleVoiceNavigate}
           userName={user?.name?.split(' ')[0] || 'Friend'}
+          onRefreshData={loadAllData}
         />
       )}
       
