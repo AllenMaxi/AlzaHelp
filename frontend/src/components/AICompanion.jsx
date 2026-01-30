@@ -11,81 +11,96 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isAwake, setIsAwake] = useState(false);
+  const [isActive, setIsActive] = useState(false); // Active conversation (no need for wake word)
   const [transcript, setTranscript] = useState('');
   const [displayText, setDisplayText] = useState('');
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [micPermission, setMicPermission] = useState('unknown');
   
-  // Multi-turn conversation
-  const [conversationMode, setConversationMode] = useState(null);
-  const [pendingData, setPendingData] = useState({});
-  const [currentField, setCurrentField] = useState(null);
+  // Multi-turn conversation for creating data
+  const [creationMode, setCreationMode] = useState(null); // 'memory', 'family', 'reminder'
+  const [creationData, setCreationData] = useState({});
+  const [creationStep, setCreationStep] = useState(0);
   
-  // Refs for stable state access
+  // Refs for callbacks
   const recognitionRef = useRef(null);
   const audioRef = useRef(null);
-  const isListeningRef = useRef(false);
-  const isSpeakingRef = useRef(false);
-  const isAwakeRef = useRef(false);
-  const conversationModeRef = useRef(null);
-  const currentFieldRef = useRef(null);
-  const pendingDataRef = useRef({});
-  const wakeWordCooldownRef = useRef(false);
-  const sessionIdRef = useRef(`companion_${Date.now()}`);
+  const stateRef = useRef({
+    isListening: false,
+    isSpeaking: false,
+    isActive: false,
+    creationMode: null,
+    creationStep: 0,
+    creationData: {}
+  });
+  const activityTimeoutRef = useRef(null);
 
-  // Keep refs in sync
-  useEffect(() => { isAwakeRef.current = isAwake; }, [isAwake]);
-  useEffect(() => { conversationModeRef.current = conversationMode; }, [conversationMode]);
-  useEffect(() => { currentFieldRef.current = currentField; }, [currentField]);
-  useEffect(() => { pendingDataRef.current = pendingData; }, [pendingData]);
+  // Keep ref in sync
+  useEffect(() => {
+    stateRef.current = {
+      isListening,
+      isSpeaking,
+      isActive,
+      creationMode,
+      creationStep,
+      creationData
+    };
+  }, [isListening, isSpeaking, isActive, creationMode, creationStep, creationData]);
 
-  // Field prompts
-  const FIELD_PROMPTS = {
+  // Creation flow configuration
+  const CREATION_FLOWS = {
     memory: {
-      fields: ['title', 'date', 'location', 'description', 'people'],
-      prompts: {
+      steps: ['title', 'date', 'location', 'description', 'people'],
+      questions: {
         title: "What would you like to call this memory?",
         date: "When did this happen?",
-        location: "Where did this take place?",
-        description: "Tell me more about what happened.",
-        people: "Who was there with you?",
+        location: "Where was it?",
+        description: "What happened? Tell me about it.",
+        people: "Who was there?"
       }
     },
     family: {
-      fields: ['name', 'relationship', 'notes'],
-      prompts: {
+      steps: ['name', 'relationship', 'notes'],
+      questions: {
         name: "What is their name?",
-        relationship: "How are they related to you?",
-        notes: "Tell me something special about them.",
+        relationship: "How are they related to you? Like son, daughter, spouse, friend?",
+        notes: "What's something special about them you want to remember?"
       }
     },
     reminder: {
-      fields: ['title', 'time'],
-      prompts: {
+      steps: ['title', 'time'],
+      questions: {
         title: "What should I remind you about?",
-        time: "What time? Say morning, afternoon, or evening.",
+        time: "When? You can say morning, afternoon, or evening."
       }
     }
   };
 
-  // Stop all audio immediately
-  const stopAllAudio = useCallback(() => {
-    // Stop HTML5 audio
+  // Reset activity timeout - keeps conversation active
+  const resetActivityTimeout = useCallback(() => {
+    if (activityTimeoutRef.current) {
+      clearTimeout(activityTimeoutRef.current);
+    }
+    // Stay active for 30 seconds after last interaction
+    activityTimeoutRef.current = setTimeout(() => {
+      if (!stateRef.current.isSpeaking && !stateRef.current.creationMode) {
+        setIsActive(false);
+        setTranscript('');
+      }
+    }, 30000);
+  }, []);
+
+  // Stop all audio
+  const stopAudio = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = '';
       audioRef.current = null;
     }
-    // Stop browser speech synthesis
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-    isSpeakingRef.current = false;
-    setIsSpeaking(false);
+    window.speechSynthesis?.cancel();
   }, []);
 
-  // Request microphone permission
+  // Request mic permission
   const requestMicPermission = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -93,70 +108,50 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       setMicPermission('granted');
       return true;
     } catch (err) {
-      console.error('Microphone permission denied:', err);
       setMicPermission('denied');
-      toast.error('Please allow microphone access to use voice commands');
+      toast.error('Please allow microphone access');
       return false;
     }
   };
 
-  // Start speech recognition
-  const startRecognition = useCallback(() => {
-    if (!recognitionRef.current || isSpeakingRef.current) return;
+  // Speak text (TTS)
+  const speak = useCallback(async (text, keepActive = true) => {
+    if (!text) return;
     
-    try {
-      recognitionRef.current.start();
-      console.log('Recognition started');
-    } catch (e) {
-      if (!e.message?.includes('already started')) {
-        console.error('Failed to start recognition:', e);
-      }
-    }
-  }, []);
-
-  // Stop speech recognition
-  const stopRecognition = useCallback(() => {
-    if (!recognitionRef.current) return;
-    try {
-      recognitionRef.current.stop();
-      console.log('Recognition stopped');
-    } catch (e) {}
-  }, []);
-
-  // Text-to-speech
-  const speak = useCallback(async (text) => {
-    if (!text || isSpeakingRef.current) {
-      console.log('Skipping speak - already speaking or no text');
+    // Prevent multiple simultaneous speeches
+    if (stateRef.current.isSpeaking) {
+      console.log('Already speaking, queuing...');
       return;
     }
+
+    console.log('Speaking:', text.substring(0, 50) + '...');
     
-    console.log('Speaking:', text);
-    
-    // Stop everything first
-    stopAllAudio();
-    stopRecognition();
-    
-    isSpeakingRef.current = true;
+    stopAudio();
     setIsSpeaking(true);
     setDisplayText(text);
+    
+    // Stop recognition while speaking to avoid hearing ourselves
+    try { recognitionRef.current?.stop(); } catch(e) {}
 
-    const onDone = () => {
-      console.log('Speech done');
-      isSpeakingRef.current = false;
+    const onComplete = () => {
+      console.log('Speech complete');
       setIsSpeaking(false);
       
-      // Restart recognition after a small delay
-      if (isListeningRef.current) {
-        setTimeout(() => {
-          if (!isSpeakingRef.current) {
-            startRecognition();
-          }
-        }, 500);
+      if (keepActive) {
+        setIsActive(true);
+        resetActivityTimeout();
       }
+      
+      // Resume recognition after delay
+      setTimeout(() => {
+        if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
+          try { recognitionRef.current?.start(); } catch(e) {}
+        }
+      }, 800); // Longer delay to avoid hearing echo
     };
 
     if (!audioEnabled) {
-      setTimeout(onDone, Math.min(text.length * 40, 3000));
+      setTimeout(onComplete, Math.min(text.length * 50, 4000));
       return;
     }
 
@@ -172,201 +167,93 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
         const data = await res.json();
         const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
         audioRef.current = audio;
-        
-        audio.onended = onDone;
-        audio.onerror = () => {
-          console.log('Audio error, using fallback');
-          browserSpeak(text, onDone);
-        };
-        
+        audio.onended = onComplete;
+        audio.onerror = () => browserSpeak(text, onComplete);
         await audio.play();
       } else {
-        browserSpeak(text, onDone);
+        browserSpeak(text, onComplete);
       }
     } catch (error) {
-      console.error('TTS error:', error);
-      browserSpeak(text, onDone);
+      browserSpeak(text, onComplete);
     }
-  }, [audioEnabled, stopAllAudio, stopRecognition, startRecognition]);
+  }, [audioEnabled, stopAudio, resetActivityTimeout]);
 
   // Browser TTS fallback
-  const browserSpeak = useCallback((text, onDone) => {
+  const browserSpeak = (text, onComplete) => {
     if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 0.9;
-      utterance.pitch = 1;
-      utterance.onend = onDone;
-      utterance.onerror = onDone;
+      utterance.onend = onComplete;
+      utterance.onerror = onComplete;
       window.speechSynthesis.speak(utterance);
     } else {
-      setTimeout(onDone, 2000);
+      setTimeout(onComplete, 2000);
     }
-  }, []);
+  };
 
-  // Process voice command
-  const processCommand = useCallback(async (command) => {
-    if (!command.trim()) return;
-    
-    console.log('Processing command:', command);
-    setIsProcessing(true);
-    setTranscript('');
-    
-    const lowerCommand = command.toLowerCase();
+  // Start creation flow
+  const startCreation = useCallback((type) => {
+    console.log('Starting creation:', type);
+    setCreationMode(type);
+    setCreationData({});
+    setCreationStep(0);
+    const firstQuestion = CREATION_FLOWS[type].questions[CREATION_FLOWS[type].steps[0]];
+    speak(`Okay, let's add a new ${type}. ${firstQuestion}`);
+  }, [speak]);
 
-    // Check for creation intents
-    if (lowerCommand.includes('add') || lowerCommand.includes('create') || lowerCommand.includes('new') || lowerCommand.includes('remember this')) {
-      if (lowerCommand.includes('memory') || lowerCommand.includes('remember')) {
-        setConversationMode('memory');
-        setPendingData({});
-        setCurrentField('title');
-        setIsProcessing(false);
-        speak(`Great! Let's add a new memory. ${FIELD_PROMPTS.memory.prompts.title}`);
-        return;
-      }
-      if (lowerCommand.includes('family') || lowerCommand.includes('person') || lowerCommand.includes('someone')) {
-        setConversationMode('family');
-        setPendingData({});
-        setCurrentField('name');
-        setIsProcessing(false);
-        speak(`Great! Let's add a family member. ${FIELD_PROMPTS.family.prompts.name}`);
-        return;
-      }
-      if (lowerCommand.includes('reminder') || lowerCommand.includes('remind')) {
-        setConversationMode('reminder');
-        setPendingData({});
-        setCurrentField('title');
-        setIsProcessing(false);
-        speak(`Sure! Let's set a reminder. ${FIELD_PROMPTS.reminder.prompts.title}`);
-        return;
-      }
-    }
+  // Handle creation flow response
+  const handleCreationResponse = useCallback(async (response) => {
+    const { creationMode: mode, creationStep: step, creationData: data } = stateRef.current;
+    if (!mode) return;
 
-    // Navigation commands
-    const navMap = {
-      'family': ['family', 'relatives', 'loved ones'],
-      'timeline': ['memories', 'memory', 'timeline'],
-      'quiz': ['quiz', 'game', 'practice', 'faces'],
-      'week': ['week', 'yesterday', 'recent', 'what did i do'],
-      'reminders': ['reminders', 'schedule', 'tasks', 'medications'],
-      'home': ['home', 'start', 'main', 'back']
-    };
+    const flow = CREATION_FLOWS[mode];
+    const currentField = flow.steps[step];
+    const newData = { ...data, [currentField]: response };
+    setCreationData(newData);
 
-    for (const [target, keywords] of Object.entries(navMap)) {
-      if (keywords.some(kw => lowerCommand.includes(kw))) {
-        const responses = {
-          family: "Let me show you your family.",
-          timeline: "Here are your precious memories.",
-          quiz: "Let's practice remembering faces!",
-          week: "Let me show you what you did recently.",
-          reminders: "Here are your reminders.",
-          home: "Taking you home."
-        };
-        
-        setIsProcessing(false);
-        setIsAwake(false);
-        speak(responses[target]);
-        setTimeout(() => onNavigate(target), 2000);
-        return;
-      }
-    }
-
-    // For questions, use backend RAG
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/voice-command`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ text: command, session_id: sessionIdRef.current })
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setIsAwake(false);
-        speak(data.response);
-        if (data.action === 'navigate') {
-          setTimeout(() => onNavigate(data.target), 2500);
-        }
-      } else {
-        setIsAwake(false);
-        speak("I'm not sure about that. Could you try asking differently?");
-      }
-    } catch (error) {
-      setIsAwake(false);
-      speak("I'm having trouble connecting. Please try again.");
-    }
-    
-    setIsProcessing(false);
-  }, [speak, onNavigate]);
-
-  // Handle field response in conversation
-  const handleFieldResponse = useCallback(async (value) => {
-    const lowerValue = value.toLowerCase();
-    const mode = conversationModeRef.current;
-    const field = currentFieldRef.current;
-    const data = pendingDataRef.current;
-    
-    // Check for cancel
-    if (lowerValue.includes('cancel') || lowerValue.includes('stop') || lowerValue.includes('never mind')) {
-      speak("No problem, cancelled.");
-      setConversationMode(null);
-      setCurrentField(null);
-      setPendingData({});
-      setIsAwake(false);
-      return;
-    }
-
-    // Store value
-    const newData = { ...data, [field]: value };
-    setPendingData(newData);
-    pendingDataRef.current = newData;
-    setTranscript('');
-
-    // Get next field
-    const fields = FIELD_PROMPTS[mode].fields;
-    const currentIndex = fields.indexOf(field);
-    const nextField = fields[currentIndex + 1];
-
-    if (nextField) {
-      setCurrentField(nextField);
-      speak(`Got it! ${FIELD_PROMPTS[mode].prompts[nextField]}`);
+    const nextStep = step + 1;
+    if (nextStep < flow.steps.length) {
+      // More questions to ask
+      setCreationStep(nextStep);
+      const nextField = flow.steps[nextStep];
+      speak(`Got it. ${flow.questions[nextField]}`);
     } else {
-      // All fields collected - save
-      await saveData(mode, newData);
+      // All done - save the data
+      await saveCreatedData(mode, newData);
     }
   }, [speak]);
 
-  // Save collected data
-  const saveData = useCallback(async (mode, data) => {
+  // Save created data
+  const saveCreatedData = async (mode, data) => {
     setIsProcessing(true);
-    
     try {
       let endpoint, body;
-      
+
       if (mode === 'memory') {
         endpoint = '/api/memories';
         body = {
-          title: data.title,
-          date: data.date,
+          title: data.title || 'Untitled Memory',
+          date: data.date || 'Unknown date',
           location: data.location || '',
           description: data.description || '',
-          people: data.people ? data.people.split(/,|and/).map(p => p.trim()) : [],
+          people: data.people ? data.people.split(/,|and/).map(p => p.trim()).filter(Boolean) : [],
           photos: []
         };
       } else if (mode === 'family') {
         endpoint = '/api/family';
         body = {
-          name: data.name,
-          relationship: data.relationship.toLowerCase(),
-          relationship_label: `Your ${data.relationship}`,
+          name: data.name || 'Unknown',
+          relationship: (data.relationship || 'family').toLowerCase(),
+          relationship_label: `Your ${data.relationship || 'family member'}`,
           notes: data.notes || '',
           photos: []
         };
       } else if (mode === 'reminder') {
         endpoint = '/api/reminders';
         const timeMap = { morning: '09:00', afternoon: '14:00', evening: '18:00', night: '20:00' };
-        const time = Object.entries(timeMap).find(([k]) => data.time?.toLowerCase().includes(k))?.[1] || '12:00';
-        body = { title: data.title, time };
+        const timeStr = data.time?.toLowerCase() || '';
+        const time = Object.entries(timeMap).find(([k]) => timeStr.includes(k))?.[1] || '12:00';
+        body = { title: data.title || 'Reminder', time };
       }
 
       const res = await fetch(`${BACKEND_URL}${endpoint}`, {
@@ -377,27 +264,121 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       });
 
       if (res.ok) {
-        speak("Done! I saved that for you. Say Hey Mate if you need anything else.");
-        if (onRefreshData) onRefreshData();
-        toast.success('Saved successfully!');
+        speak(`Done! I've saved that. What else can I help you with?`);
+        toast.success(`${mode} added successfully!`);
+        onRefreshData?.();
       } else {
-        speak("I had trouble saving. Please try again.");
+        speak("I had trouble saving that. Want to try again?");
       }
     } catch (error) {
       speak("Something went wrong. Please try again.");
     }
 
-    setConversationMode(null);
-    setCurrentField(null);
-    setPendingData({});
-    setIsAwake(false);
+    setCreationMode(null);
+    setCreationStep(0);
+    setCreationData({});
     setIsProcessing(false);
-  }, [speak, onRefreshData]);
+  };
 
-  // Initialize speech recognition once
+  // Process voice command
+  const processCommand = useCallback(async (command) => {
+    const lowerCmd = command.toLowerCase();
+    console.log('Processing:', command);
+    
+    setIsProcessing(true);
+    setTranscript('');
+
+    // Check for cancel during creation
+    if (stateRef.current.creationMode) {
+      if (lowerCmd.includes('cancel') || lowerCmd.includes('stop') || lowerCmd.includes('never mind')) {
+        setCreationMode(null);
+        setCreationStep(0);
+        setCreationData({});
+        speak("Okay, cancelled. What else can I help with?");
+        setIsProcessing(false);
+        return;
+      }
+      // Continue creation flow
+      handleCreationResponse(command);
+      setIsProcessing(false);
+      return;
+    }
+
+    // Check for creation intents
+    if (lowerCmd.match(/\b(add|create|new|make|save)\b.*\b(memory|remember)\b/) || 
+        lowerCmd.match(/\b(remember|record)\b.*\b(this|something)\b/)) {
+      startCreation('memory');
+      setIsProcessing(false);
+      return;
+    }
+    if (lowerCmd.match(/\b(add|create|new)\b.*\b(family|person|someone|member)\b/)) {
+      startCreation('family');
+      setIsProcessing(false);
+      return;
+    }
+    if (lowerCmd.match(/\b(add|create|set|new)\b.*\b(reminder|remind|alarm)\b/) ||
+        lowerCmd.match(/\bremind me\b/)) {
+      startCreation('reminder');
+      setIsProcessing(false);
+      return;
+    }
+
+    // Navigation
+    const navPatterns = {
+      family: /\b(family|relatives|loved ones|who is my)\b/,
+      timeline: /\b(memories|memory|timeline|photos)\b/,
+      quiz: /\b(quiz|game|practice|faces)\b/,
+      week: /\b(week|yesterday|today|recent|what did i do)\b/,
+      reminders: /\b(reminders?|schedule|tasks?|medication)\b/,
+      home: /\b(home|back|start)\b/
+    };
+
+    for (const [target, pattern] of Object.entries(navPatterns)) {
+      if (pattern.test(lowerCmd)) {
+        const responses = {
+          family: "Here's your family.",
+          timeline: "Let me show you your memories.",
+          quiz: "Let's practice remembering faces!",
+          week: "Here's what you did recently.",
+          reminders: "Here are your reminders.",
+          home: "Going home."
+        };
+        speak(responses[target]);
+        setTimeout(() => onNavigate(target), 1500);
+        setIsProcessing(false);
+        return;
+      }
+    }
+
+    // General question - use backend
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/voice-command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ text: command, session_id: `voice_${Date.now()}` })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        speak(data.response);
+        if (data.action === 'navigate') {
+          setTimeout(() => onNavigate(data.target), 2000);
+        }
+      } else {
+        speak("I'm not sure about that. Can you ask differently?");
+      }
+    } catch (error) {
+      speak("I'm having trouble. Please try again.");
+    }
+    
+    setIsProcessing(false);
+  }, [speak, startCreation, handleCreationResponse, onNavigate]);
+
+  // Initialize recognition
   useEffect(() => {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      toast.error('Voice recognition not supported in this browser');
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+      toast.error('Voice not supported in this browser');
       return;
     }
 
@@ -407,62 +388,52 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
-    recognition.maxAlternatives = 1;
 
-    recognition.onstart = () => {
-      console.log('Recognition started');
-    };
+    let lastProcessedText = '';
+    let processingLock = false;
 
     recognition.onresult = (event) => {
-      // Don't process if speaking
-      if (isSpeakingRef.current) return;
-      
-      let finalTranscript = '';
-      let interimTranscript = '';
+      // Skip if speaking
+      if (stateRef.current.isSpeaking) return;
+
+      let final = '';
+      let interim = '';
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const text = event.results[i][0].transcript;
         if (event.results[i].isFinal) {
-          finalTranscript += text;
+          final += text;
         } else {
-          interimTranscript += text;
+          interim += text;
         }
       }
 
-      const heard = (finalTranscript || interimTranscript).toLowerCase().trim();
-      
-      // Show what we're hearing
-      if (interimTranscript) {
-        setTranscript(interimTranscript);
+      const heard = (final || interim).trim();
+      if (interim) setTranscript(interim);
+
+      // Check wake word if not active
+      if (!stateRef.current.isActive && !stateRef.current.creationMode) {
+        if (heard.toLowerCase().includes(WAKE_WORD)) {
+          console.log('Wake word detected');
+          setIsActive(true);
+          setTranscript('');
+          speak("Yes, I'm here. What do you need?");
+          return;
+        }
       }
 
-      // Check for wake word (with cooldown to prevent multiple triggers)
-      if (!isAwakeRef.current && !wakeWordCooldownRef.current && heard.includes(WAKE_WORD)) {
-        console.log('Wake word detected!');
-        wakeWordCooldownRef.current = true;
-        setTimeout(() => { wakeWordCooldownRef.current = false; }, 3000);
+      // Process final transcript
+      if (final && (stateRef.current.isActive || stateRef.current.creationMode)) {
+        const cleanCmd = final.replace(/hey mate/gi, '').trim();
         
-        setIsAwake(true);
-        isAwakeRef.current = true;
-        setTranscript('');
-        speak("Yes, I'm listening. How can I help?");
-        return;
-      }
-
-      // Process final command when awake
-      if (isAwakeRef.current && finalTranscript && !isSpeakingRef.current) {
-        const command = finalTranscript.replace(/hey mate/gi, '').trim();
-        
-        if (command.length > 2) {
-          console.log('Final command:', command);
-          setTranscript(command);
+        // Prevent duplicate processing
+        if (cleanCmd.length > 2 && cleanCmd !== lastProcessedText && !processingLock) {
+          lastProcessedText = cleanCmd;
+          processingLock = true;
+          setTimeout(() => { processingLock = false; }, 2000);
           
-          // Check if in conversation mode
-          if (conversationModeRef.current && currentFieldRef.current) {
-            handleFieldResponse(command);
-          } else {
-            processCommand(command);
-          }
+          setTranscript(cleanCmd);
+          processCommand(cleanCmd);
         }
       }
     };
@@ -471,75 +442,68 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       console.error('Recognition error:', event.error);
       if (event.error === 'not-allowed') {
         setMicPermission('denied');
-        toast.error('Microphone access denied');
       }
     };
 
     recognition.onend = () => {
-      console.log('Recognition ended, listening:', isListeningRef.current, 'speaking:', isSpeakingRef.current);
-      
-      // Auto-restart if should be listening and not speaking
-      if (isListeningRef.current && !isSpeakingRef.current) {
+      // Auto restart if listening and not speaking
+      if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
         setTimeout(() => {
-          if (isListeningRef.current && !isSpeakingRef.current) {
-            try {
-              recognition.start();
-            } catch (e) {}
+          if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
+            try { recognition.start(); } catch(e) {}
           }
-        }, 200);
+        }, 300);
       }
     };
 
     recognitionRef.current = recognition;
 
     return () => {
-      isListeningRef.current = false;
       try { recognition.stop(); } catch(e) {}
+      if (activityTimeoutRef.current) clearTimeout(activityTimeoutRef.current);
     };
-  }, [speak, processCommand, handleFieldResponse]);
+  }, [processCommand, speak]);
 
   // Start listening
   const startListening = async () => {
     if (micPermission !== 'granted') {
-      const granted = await requestMicPermission();
-      if (!granted) return;
+      const ok = await requestMicPermission();
+      if (!ok) return;
     }
 
-    isListeningRef.current = true;
     setIsListening(true);
-    startRecognition();
-    toast.success('Listening! Say "Hey Mate" to talk to me.');
+    try { recognitionRef.current?.start(); } catch(e) {}
+    toast.success('Listening! Say "Hey Mate" to start.');
   };
 
   // Stop listening
   const stopListening = () => {
-    isListeningRef.current = false;
     setIsListening(false);
-    setIsAwake(false);
-    isAwakeRef.current = false;
+    setIsActive(false);
     setTranscript('');
-    setConversationMode(null);
-    setCurrentField(null);
-    setPendingData({});
-    stopAllAudio();
-    stopRecognition();
+    setCreationMode(null);
+    setCreationStep(0);
+    setCreationData({});
+    stopAudio();
+    try { recognitionRef.current?.stop(); } catch(e) {}
   };
 
-  // Get status text
+  // Status display
   const getStatus = () => {
-    if (isProcessing) return { title: "Thinking...", subtitle: "Please wait" };
-    if (isSpeaking) return { title: "Speaking...", subtitle: displayText };
-    if (conversationMode) return { 
-      title: `Adding ${conversationMode}...`, 
-      subtitle: transcript || `Waiting for ${currentField}...` 
-    };
-    if (isAwake) return { title: "I'm listening...", subtitle: transcript || "Tell me what you need" };
-    if (isListening) return { title: `Hello, ${userName}!`, subtitle: 'Say "Hey Mate" to talk to me' };
-    return { title: `Hello, ${userName}!`, subtitle: "Tap Start Listening to begin" };
+    if (isProcessing) return { title: "Thinking...", sub: "One moment" };
+    if (isSpeaking) return { title: "Speaking...", sub: displayText };
+    if (creationMode) {
+      const field = CREATION_FLOWS[creationMode].steps[creationStep];
+      return { title: `Adding ${creationMode}...`, sub: transcript || `Tell me the ${field}` };
+    }
+    if (isActive) return { title: "I'm listening!", sub: transcript || "Go ahead, I'm here" };
+    if (isListening) return { title: `Hello, ${userName}!`, sub: 'Say "Hey Mate" to talk' };
+    return { title: `Hello, ${userName}!`, sub: "Tap Start to begin" };
   };
 
   const status = getStatus();
-  
+  const showActiveState = isActive || creationMode;
+
   const quickActions = [
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
@@ -552,53 +516,42 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
     <div className="min-h-[80vh] flex flex-col items-center justify-center px-4 py-8">
       {/* Avatar */}
       <div className="relative mb-6">
-        {/* Animated rings */}
-        {(isAwake || conversationMode) && !isSpeaking && (
-          <>
-            <div className="absolute inset-[-15px] rounded-full border-4 border-success/40 animate-ping" style={{ animationDuration: '2s' }} />
-            <div className="absolute inset-[-8px] rounded-full border-4 border-success animate-pulse" />
-          </>
+        {showActiveState && !isSpeaking && (
+          <div className="absolute inset-[-12px] rounded-full border-4 border-success animate-pulse" />
         )}
         {isSpeaking && (
-          <>
-            <div className="absolute inset-[-15px] rounded-full border-4 border-primary/40 animate-ping" style={{ animationDuration: '1s' }} />
-            <div className="absolute inset-[-8px] rounded-full border-4 border-primary animate-pulse" />
-          </>
+          <div className="absolute inset-[-12px] rounded-full border-4 border-primary animate-pulse" />
         )}
-        {isListening && !isAwake && !isSpeaking && !conversationMode && (
-          <div className="absolute inset-[-5px] rounded-full border-2 border-muted-foreground/30 animate-pulse" />
+        {isListening && !showActiveState && !isSpeaking && (
+          <div className="absolute inset-[-6px] rounded-full border-2 border-muted-foreground/40" />
         )}
         
-        {/* Avatar image */}
         <div 
           className={`
             relative w-44 h-44 md:w-52 md:h-52 rounded-full overflow-hidden cursor-pointer
             border-4 shadow-elevated transition-all duration-300
             ${isSpeaking ? 'border-primary scale-105' : ''}
-            ${(isAwake || conversationMode) && !isSpeaking ? 'border-success scale-105' : ''}
-            ${isListening && !isAwake && !isSpeaking ? 'border-muted-foreground/50' : ''}
+            ${showActiveState && !isSpeaking ? 'border-success scale-105' : ''}
+            ${isListening && !showActiveState && !isSpeaking ? 'border-muted-foreground/50' : ''}
             ${!isListening ? 'border-muted hover:border-primary' : ''}
           `}
           onClick={() => {
-            if (!isListening) {
-              startListening();
-            } else if (!isAwake && !isSpeaking) {
-              setIsAwake(true);
-              isAwakeRef.current = true;
-              speak("Yes, how can I help you?");
+            if (!isListening) startListening();
+            else if (!isActive && !isSpeaking) {
+              setIsActive(true);
+              speak("Yes, how can I help?");
             }
           }}
         >
-          <img src={AVATAR_URL} alt="Memory Companion" className="w-full h-full object-cover" />
+          <img src={AVATAR_URL} alt="Companion" className="w-full h-full object-cover" />
           
-          {/* Status indicator */}
           <div className={`absolute bottom-1 right-1 rounded-full p-2 shadow-lg ${
-            isAwake || conversationMode ? 'bg-success' : isSpeaking ? 'bg-primary' : isListening ? 'bg-background' : 'bg-muted'
+            showActiveState ? 'bg-success' : isSpeaking ? 'bg-primary' : 'bg-background'
           }`}>
             {isProcessing ? (
               <Loader2 className="h-4 w-4 animate-spin text-white" />
             ) : (
-              <Mic className={`h-4 w-4 ${(isAwake || conversationMode || isSpeaking) ? 'text-white' : 'text-muted-foreground'} ${isAwake ? 'animate-pulse' : ''}`} />
+              <Mic className={`h-4 w-4 ${showActiveState || isSpeaking ? 'text-white' : 'text-muted-foreground'}`} />
             )}
           </div>
         </div>
@@ -607,16 +560,13 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       {/* Status */}
       <div className="text-center mb-6 max-w-lg">
         <h2 className="text-2xl md:text-3xl font-bold text-foreground mb-2">{status.title}</h2>
-        <p className={`text-lg md:text-xl transition-colors ${
-          isSpeaking ? 'text-primary' : (isAwake || conversationMode) ? 'text-success' : 'text-muted-foreground'
-        }`}>
-          {status.subtitle}
+        <p className={`text-lg ${isSpeaking ? 'text-primary' : showActiveState ? 'text-success' : 'text-muted-foreground'}`}>
+          {status.sub}
         </p>
         
-        {/* Live transcript */}
-        {transcript && (isAwake || conversationMode) && !isSpeaking && (
-          <div className="mt-4 p-3 bg-success/10 rounded-xl border-2 border-success/30 animate-pulse">
-            <p className="text-success font-medium">🎤 Heard: "{transcript}"</p>
+        {transcript && showActiveState && !isSpeaking && (
+          <div className="mt-4 p-3 bg-success/10 rounded-xl border-2 border-success/40">
+            <p className="text-success font-medium">🎤 "{transcript}"</p>
           </div>
         )}
       </div>
@@ -633,45 +583,30 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
           {isListening ? 'Stop' : 'Start Listening'}
         </Button>
         
-        <Button
-          variant="outline"
-          size="lg"
-          className="px-5 py-6"
-          onClick={() => setAudioEnabled(!audioEnabled)}
-          title={audioEnabled ? 'Mute voice' : 'Unmute voice'}
-        >
+        <Button variant="outline" size="lg" className="px-5 py-6" onClick={() => setAudioEnabled(!audioEnabled)}>
           {audioEnabled ? <Volume2 className="h-6 w-6" /> : <VolumeX className="h-6 w-6" />}
         </Button>
 
         {isSpeaking && (
-          <Button variant="outline" size="lg" className="px-5 py-6" onClick={stopAllAudio}>
+          <Button variant="outline" size="lg" className="px-5 py-6" onClick={() => { stopAudio(); setIsSpeaking(false); }}>
             Stop
           </Button>
         )}
       </div>
 
-      {/* Mic permission warning */}
       {micPermission === 'denied' && (
-        <div className="mb-6 p-4 bg-destructive/10 rounded-xl border border-destructive/30 max-w-md text-center">
+        <div className="mb-6 p-4 bg-destructive/10 rounded-xl border border-destructive/30 text-center">
           <p className="text-destructive font-medium">⚠️ Microphone blocked</p>
-          <p className="text-sm text-muted-foreground mt-1">Enable it in browser settings</p>
         </div>
       )}
 
       {/* Quick navigation */}
       <div className="w-full max-w-2xl">
-        <p className="text-center text-sm text-muted-foreground mb-3">Or tap to navigate:</p>
+        <p className="text-center text-sm text-muted-foreground mb-3">Or tap:</p>
         <div className="flex flex-wrap justify-center gap-2">
-          {quickActions.map((action) => (
-            <Button
-              key={action.id}
-              variant="outline"
-              size="lg"
-              className="gap-2"
-              onClick={() => onNavigate(action.id)}
-            >
-              <action.icon className="h-5 w-5" />
-              {action.label}
+          {quickActions.map((a) => (
+            <Button key={a.id} variant="outline" size="lg" className="gap-2" onClick={() => onNavigate(a.id)}>
+              <a.icon className="h-5 w-5" /> {a.label}
             </Button>
           ))}
         </div>
@@ -681,15 +616,11 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       <div className="mt-8 text-center">
         <p className="text-sm text-muted-foreground mb-3">Try saying:</p>
         <div className="flex flex-wrap justify-center gap-2 max-w-xl">
-          {["Add a new memory", "Who is in my family?", "What did I do yesterday?", "Add a family member", "Set a reminder"].map((cmd) => (
+          {["Add a memory", "Who is Maria?", "Add a family member", "Set a reminder", "Show my week"].map((cmd) => (
             <button
               key={cmd}
-              onClick={() => {
-                setIsAwake(true);
-                isAwakeRef.current = true;
-                processCommand(cmd);
-              }}
-              className="bg-muted hover:bg-muted/80 px-3 py-1.5 rounded-full text-sm transition-colors"
+              onClick={() => { setIsActive(true); processCommand(cmd); }}
+              className="bg-muted hover:bg-muted/80 px-3 py-1.5 rounded-full text-sm"
             >
               "{cmd}"
             </button>
