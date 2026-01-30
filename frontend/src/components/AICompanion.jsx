@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, Volume2, VolumeX, Users, Calendar, Brain, Bell, CalendarDays, MessageCircle, Home } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Users, Calendar, Brain, Bell, CalendarDays, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 
@@ -7,63 +7,75 @@ const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const WAKE_WORD = "hey mate";
 const AVATAR_URL = "https://static.prod-images.emergentagent.com/jobs/7e703976-b1b5-4cac-8bb4-5016cc00ab1e/images/8861c004f3887363a550e65273e509f4b2a83fa5a022f2e61f3c6318cf99be61.png";
 
-// Conversation states for multi-turn dialogs
-const CONVERSATION_STATES = {
-  IDLE: 'idle',
-  LISTENING_WAKE: 'listening_wake',
-  LISTENING_COMMAND: 'listening_command',
-  PROCESSING: 'processing',
-  SPEAKING: 'speaking',
-  // Multi-turn states for creating data
-  CREATING_MEMORY: 'creating_memory',
-  CREATING_FAMILY: 'creating_family',
-  CREATING_REMINDER: 'creating_reminder',
-};
-
 export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) => {
-  const [conversationState, setConversationState] = useState(CONVERSATION_STATES.IDLE);
   const [isListening, setIsListening] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isAwake, setIsAwake] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [displayText, setDisplayText] = useState('');
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [sessionId] = useState(() => `companion_${Date.now()}`);
+  const [micPermission, setMicPermission] = useState('unknown');
   
-  // Multi-turn conversation data
+  // Multi-turn conversation
+  const [conversationMode, setConversationMode] = useState(null); // 'memory', 'family', 'reminder'
   const [pendingData, setPendingData] = useState({});
   const [currentField, setCurrentField] = useState(null);
   
   const recognitionRef = useRef(null);
   const audioRef = useRef(null);
-  const silenceTimeoutRef = useRef(null);
+  const isListeningRef = useRef(false);
 
-  // Field prompts for creating data
+  // Field prompts
   const FIELD_PROMPTS = {
     memory: {
-      title: "What would you like to call this memory?",
-      date: "When did this happen? You can say something like 'last week' or 'June 2020'.",
-      location: "Where did this take place?",
-      description: "Tell me more about this memory. What happened?",
-      people: "Who was there with you?",
-      confirm: "I have all the details. Should I save this memory?"
+      fields: ['title', 'date', 'location', 'description', 'people'],
+      prompts: {
+        title: "What would you like to call this memory?",
+        date: "When did this happen?",
+        location: "Where did this take place?",
+        description: "Tell me more about what happened.",
+        people: "Who was there with you?",
+      }
     },
     family: {
-      name: "What is their name?",
-      relationship: "How are they related to you? For example, son, daughter, spouse, friend.",
-      notes: "Tell me something special about them that you'd like to remember.",
-      confirm: "Should I add this person to your family?"
+      fields: ['name', 'relationship', 'notes'],
+      prompts: {
+        name: "What is their name?",
+        relationship: "How are they related to you?",
+        notes: "Tell me something special about them.",
+      }
     },
     reminder: {
-      title: "What should I remind you about?",
-      time: "What time should I remind you? You can say morning, afternoon, or evening.",
-      confirm: "Should I set this reminder?"
+      fields: ['title', 'time'],
+      prompts: {
+        title: "What should I remind you about?",
+        time: "What time? Say morning, afternoon, or evening.",
+      }
+    }
+  };
+
+  // Request microphone permission
+  const requestMicPermission = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
+      setMicPermission('granted');
+      return true;
+    } catch (err) {
+      console.error('Microphone permission denied:', err);
+      setMicPermission('denied');
+      toast.error('Please allow microphone access to use voice commands');
+      return false;
     }
   };
 
   // Initialize speech recognition
-  useEffect(() => {
+  const initRecognition = useCallback(() => {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      console.warn('Speech recognition not supported');
-      return;
+      toast.error('Voice recognition is not supported in this browser');
+      return null;
     }
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -72,141 +84,157 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
+
+    return recognition;
+  }, []);
+
+  // Setup recognition event handlers
+  useEffect(() => {
+    const recognition = initRecognition();
+    if (!recognition) return;
+
+    recognition.onstart = () => {
+      console.log('Speech recognition started');
+      isListeningRef.current = true;
+    };
 
     recognition.onresult = (event) => {
       let finalTranscript = '';
       let interimTranscript = '';
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcriptText = event.results[i][0].transcript;
+        const text = event.results[i][0].transcript;
         if (event.results[i].isFinal) {
-          finalTranscript += transcriptText;
+          finalTranscript += text;
         } else {
-          interimTranscript += transcriptText;
+          interimTranscript += text;
         }
       }
 
-      const currentTranscript = (finalTranscript || interimTranscript).toLowerCase();
-      
-      // Check for wake word when idle
-      if (conversationState === CONVERSATION_STATES.LISTENING_WAKE) {
-        if (currentTranscript.includes(WAKE_WORD)) {
-          setConversationState(CONVERSATION_STATES.LISTENING_COMMAND);
-          setTranscript('');
-          speak("Yes, I'm here. How can I help you today?");
-          return;
-        }
-        setTranscript(interimTranscript);
+      const heard = (finalTranscript || interimTranscript).toLowerCase().trim();
+      console.log('Heard:', heard, 'Final:', !!finalTranscript);
+
+      // Always show what we're hearing
+      setTranscript(interimTranscript || finalTranscript);
+
+      // Check for wake word if not awake
+      if (!isAwake && heard.includes(WAKE_WORD)) {
+        console.log('Wake word detected!');
+        setIsAwake(true);
+        setTranscript('');
+        speak("Yes, I'm listening. How can I help you?");
+        return;
       }
-      // Capture command when actively listening
-      else if (conversationState === CONVERSATION_STATES.LISTENING_COMMAND && finalTranscript) {
+
+      // Process final transcript when awake
+      if (isAwake && finalTranscript && !isSpeaking && !isProcessing) {
         const command = finalTranscript.replace(/hey mate/gi, '').trim();
         if (command.length > 2) {
-          setTranscript(command);
-          processCommand(command);
-        }
-      }
-      // Multi-turn conversation - capture field values
-      else if ([CONVERSATION_STATES.CREATING_MEMORY, CONVERSATION_STATES.CREATING_FAMILY, CONVERSATION_STATES.CREATING_REMINDER].includes(conversationState)) {
-        if (finalTranscript) {
-          const value = finalTranscript.trim();
-          if (value.length > 1) {
-            setTranscript(value);
-            handleFieldResponse(value);
+          console.log('Processing command:', command);
+          
+          if (conversationMode && currentField) {
+            handleFieldResponse(command);
+          } else {
+            processCommand(command);
           }
-        } else {
-          setTranscript(interimTranscript);
         }
-      }
-
-      // Reset silence timeout
-      if (silenceTimeoutRef.current) {
-        clearTimeout(silenceTimeoutRef.current);
-      }
-      if (conversationState === CONVERSATION_STATES.LISTENING_COMMAND) {
-        silenceTimeoutRef.current = setTimeout(() => {
-          if (conversationState === CONVERSATION_STATES.LISTENING_COMMAND) {
-            speak("I didn't hear anything. Say 'Hey Mate' when you need me.");
-            setConversationState(CONVERSATION_STATES.LISTENING_WAKE);
-            setTranscript('');
-          }
-        }, 8000);
       }
     };
 
     recognition.onerror = (event) => {
       console.error('Speech recognition error:', event.error);
-      if (event.error === 'no-speech') {
-        // Silently continue
-      } else if (event.error !== 'aborted') {
-        setIsListening(false);
+      if (event.error === 'not-allowed') {
+        setMicPermission('denied');
+        toast.error('Microphone access denied. Please enable it in browser settings.');
+      } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        // Try to restart on other errors
+        setTimeout(() => {
+          if (isListeningRef.current) {
+            try { recognition.start(); } catch(e) {}
+          }
+        }, 1000);
       }
     };
 
     recognition.onend = () => {
-      if (isListening && conversationState !== CONVERSATION_STATES.SPEAKING) {
-        try {
-          recognition.start();
-        } catch (e) {
-          console.error('Failed to restart recognition:', e);
-        }
+      console.log('Speech recognition ended, isListening:', isListeningRef.current);
+      // Auto-restart if we should still be listening
+      if (isListeningRef.current && !isSpeaking) {
+        setTimeout(() => {
+          try {
+            recognition.start();
+          } catch (e) {
+            console.log('Could not restart recognition:', e);
+          }
+        }, 100);
       }
     };
 
     recognitionRef.current = recognition;
 
     return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-      if (silenceTimeoutRef.current) {
-        clearTimeout(silenceTimeoutRef.current);
-      }
+      isListeningRef.current = false;
+      try { recognition.stop(); } catch(e) {}
     };
-  }, [conversationState, isListening]);
+  }, [isAwake, conversationMode, currentField, isSpeaking, isProcessing]);
 
-  // Auto-start listening on mount
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      startListening();
-      speak(`Hello ${userName}! I'm your memory companion. Say "Hey Mate" anytime you need help remembering something, adding a memory, or just want to chat.`);
-    }, 1000);
-    return () => clearTimeout(timer);
-  }, [userName]);
+  // Start listening
+  const startListening = async () => {
+    if (micPermission !== 'granted') {
+      const granted = await requestMicPermission();
+      if (!granted) return;
+    }
 
-  const startListening = useCallback(() => {
+    if (!recognitionRef.current) {
+      recognitionRef.current = initRecognition();
+    }
+
     try {
-      recognitionRef.current?.start();
+      isListeningRef.current = true;
+      recognitionRef.current.start();
       setIsListening(true);
-      setConversationState(CONVERSATION_STATES.LISTENING_WAKE);
+      toast.success('Listening! Say "Hey Mate" to talk to me.');
     } catch (e) {
       console.error('Failed to start recognition:', e);
+      // If already started, that's fine
+      if (e.message?.includes('already started')) {
+        setIsListening(true);
+      }
     }
-  }, []);
+  };
 
-  const stopListening = useCallback(() => {
-    recognitionRef.current?.stop();
+  // Stop listening
+  const stopListening = () => {
+    isListeningRef.current = false;
     setIsListening(false);
-    setConversationState(CONVERSATION_STATES.IDLE);
+    setIsAwake(false);
     setTranscript('');
-  }, []);
+    try { recognitionRef.current?.stop(); } catch(e) {}
+  };
 
-  // Text-to-speech using OpenAI TTS
+  // Text-to-speech
   const speak = async (text) => {
     if (!text) return;
     
-    const previousState = conversationState;
-    setConversationState(CONVERSATION_STATES.SPEAKING);
+    setIsSpeaking(true);
     setDisplayText(text);
 
     // Pause recognition while speaking
-    recognitionRef.current?.stop();
+    try { recognitionRef.current?.stop(); } catch(e) {}
+
+    const onDone = () => {
+      setIsSpeaking(false);
+      // Resume listening after speaking
+      if (isListeningRef.current) {
+        setTimeout(() => {
+          try { recognitionRef.current?.start(); } catch(e) {}
+        }, 300);
+      }
+    };
 
     if (!audioEnabled) {
-      // Just display the text, then resume
-      setTimeout(() => {
-        resumeAfterSpeaking(previousState);
-      }, 2000);
+      setTimeout(onDone, Math.min(text.length * 50, 3000));
       return;
     }
 
@@ -222,84 +250,83 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
         const data = await res.json();
         const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
         audioRef.current = audio;
-        
-        audio.onended = () => {
-          resumeAfterSpeaking(previousState);
-        };
-        
+        audio.onended = onDone;
         audio.onerror = () => {
-          fallbackSpeak(text, previousState);
+          console.log('Audio error, using fallback');
+          fallbackSpeak(text, onDone);
         };
-        
         await audio.play();
       } else {
-        fallbackSpeak(text, previousState);
+        fallbackSpeak(text, onDone);
       }
     } catch (error) {
       console.error('TTS error:', error);
-      fallbackSpeak(text, previousState);
+      fallbackSpeak(text, onDone);
     }
   };
 
-  const fallbackSpeak = (text, previousState) => {
+  // Browser TTS fallback
+  const fallbackSpeak = (text, onDone) => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 0.85;
-      utterance.onend = () => resumeAfterSpeaking(previousState);
+      utterance.rate = 0.9;
+      utterance.pitch = 1;
+      utterance.onend = onDone;
+      utterance.onerror = onDone;
       window.speechSynthesis.speak(utterance);
     } else {
-      setTimeout(() => resumeAfterSpeaking(previousState), 2000);
+      setTimeout(onDone, 2000);
     }
   };
 
-  const resumeAfterSpeaking = (previousState) => {
-    setConversationState(
-      [CONVERSATION_STATES.CREATING_MEMORY, CONVERSATION_STATES.CREATING_FAMILY, CONVERSATION_STATES.CREATING_REMINDER].includes(previousState)
-        ? previousState
-        : CONVERSATION_STATES.LISTENING_COMMAND
-    );
-    if (isListening) {
-      try {
-        recognitionRef.current?.start();
-      } catch (e) {
-        console.error('Failed to resume recognition:', e);
-      }
+  // Stop speaking
+  const stopSpeaking = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
     }
+    window.speechSynthesis?.cancel();
+    setIsSpeaking(false);
   };
 
   // Process voice command
   const processCommand = async (command) => {
     if (!command.trim()) return;
     
-    setConversationState(CONVERSATION_STATES.PROCESSING);
+    setIsProcessing(true);
+    setIsAwake(false);
+    setTranscript('');
     const lowerCommand = command.toLowerCase();
 
     // Check for creation intents
-    if (lowerCommand.includes('add') || lowerCommand.includes('create') || lowerCommand.includes('new') || lowerCommand.includes('remember')) {
+    if (lowerCommand.includes('add') || lowerCommand.includes('create') || lowerCommand.includes('new') || lowerCommand.includes('remember this')) {
       if (lowerCommand.includes('memory') || lowerCommand.includes('remember')) {
-        startCreatingMemory();
+        startConversation('memory');
+        setIsProcessing(false);
         return;
       }
       if (lowerCommand.includes('family') || lowerCommand.includes('person') || lowerCommand.includes('someone')) {
-        startCreatingFamily();
+        startConversation('family');
+        setIsProcessing(false);
         return;
       }
       if (lowerCommand.includes('reminder') || lowerCommand.includes('remind')) {
-        startCreatingReminder();
+        startConversation('reminder');
+        setIsProcessing(false);
         return;
       }
     }
 
     // Navigation commands
     const navMap = {
-      'family': ['family', 'relatives', 'loved ones'],
+      'family': ['family', 'relatives', 'loved ones', 'who is my'],
       'timeline': ['memories', 'memory', 'timeline', 'remember'],
       'quiz': ['quiz', 'game', 'practice', 'faces'],
       'week': ['week', 'yesterday', 'today', 'recent', 'what did i do'],
-      'assistant': ['chat', 'talk', 'help'],
-      'reminders': ['reminders', 'schedule', 'tasks'],
-      'home': ['home', 'start', 'main']
+      'assistant': ['chat', 'talk', 'help me'],
+      'reminders': ['reminders', 'schedule', 'tasks', 'medications'],
+      'home': ['home', 'start', 'main', 'back']
     };
 
     for (const [target, keywords] of Object.entries(navMap)) {
@@ -307,19 +334,22 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
         const responses = {
           family: "Let me show you your family.",
           timeline: "Here are your precious memories.",
-          quiz: "Let's practice remembering faces together!",
+          quiz: "Let's practice remembering faces!",
           week: "Let me show you what you did recently.",
-          assistant: "I'm right here to help you.",
-          reminders: "Here are your reminders for today.",
-          home: "Taking you back home."
+          assistant: "I'm here to help you.",
+          reminders: "Here are your reminders.",
+          home: "Taking you home."
         };
-        speak(responses[target] || `Going to ${target}.`);
-        setTimeout(() => onNavigate(target), 1500);
+        speak(responses[target]);
+        setTimeout(() => {
+          onNavigate(target);
+          setIsProcessing(false);
+        }, 1500);
         return;
       }
     }
 
-    // For questions, use the backend RAG
+    // For questions, use backend RAG
     try {
       const res = await fetch(`${BACKEND_URL}/api/voice-command`, {
         method: 'POST',
@@ -331,144 +361,90 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       if (res.ok) {
         const data = await res.json();
         speak(data.response);
-        
-        if (data.action === 'navigate' && onNavigate) {
+        if (data.action === 'navigate') {
           setTimeout(() => onNavigate(data.target), 2000);
         }
       } else {
-        speak("I'm not sure about that. Could you ask me differently?");
+        speak("I'm not sure about that. Could you try asking differently?");
       }
     } catch (error) {
-      speak("I'm having trouble understanding. Please try again.");
+      speak("I'm having trouble connecting. Please try again.");
     }
+    
+    setIsProcessing(false);
   };
 
-  // Start multi-turn memory creation
-  const startCreatingMemory = () => {
+  // Start multi-turn conversation
+  const startConversation = (mode) => {
+    setConversationMode(mode);
     setPendingData({});
-    setCurrentField('title');
-    setConversationState(CONVERSATION_STATES.CREATING_MEMORY);
-    speak(FIELD_PROMPTS.memory.title);
+    const firstField = FIELD_PROMPTS[mode].fields[0];
+    setCurrentField(firstField);
+    setIsAwake(true);
+    speak(`Great! Let's add a new ${mode}. ${FIELD_PROMPTS[mode].prompts[firstField]}`);
   };
 
-  const startCreatingFamily = () => {
-    setPendingData({});
-    setCurrentField('name');
-    setConversationState(CONVERSATION_STATES.CREATING_FAMILY);
-    speak(FIELD_PROMPTS.family.name);
-  };
-
-  const startCreatingReminder = () => {
-    setPendingData({});
-    setCurrentField('title');
-    setConversationState(CONVERSATION_STATES.CREATING_REMINDER);
-    speak(FIELD_PROMPTS.reminder.title);
-  };
-
-  // Handle field response in multi-turn conversation
+  // Handle field response in conversation
   const handleFieldResponse = async (value) => {
     const lowerValue = value.toLowerCase();
     
-    // Check for cancellation
+    // Check for cancel
     if (lowerValue.includes('cancel') || lowerValue.includes('stop') || lowerValue.includes('never mind')) {
-      speak("No problem, I've cancelled that. Let me know if you need anything else.");
-      setPendingData({});
-      setCurrentField(null);
-      setConversationState(CONVERSATION_STATES.LISTENING_COMMAND);
+      speak("No problem, I've cancelled that.");
+      resetConversation();
       return;
     }
 
-    // Handle confirmation
-    if (currentField === 'confirm') {
-      if (lowerValue.includes('yes') || lowerValue.includes('sure') || lowerValue.includes('save') || lowerValue.includes('ok')) {
-        await saveData();
-      } else if (lowerValue.includes('no') || lowerValue.includes('cancel')) {
-        speak("Alright, I won't save that. Let me know if you want to try again.");
-        setPendingData({});
-        setCurrentField(null);
-        setConversationState(CONVERSATION_STATES.LISTENING_COMMAND);
-      } else {
-        speak("Please say yes to save, or no to cancel.");
-      }
-      return;
-    }
-
-    // Store the field value and move to next
+    // Store value
     const newData = { ...pendingData, [currentField]: value };
     setPendingData(newData);
+    setTranscript('');
 
-    // Determine next field based on conversation state
-    let fields, prompts;
-    if (conversationState === CONVERSATION_STATES.CREATING_MEMORY) {
-      fields = ['title', 'date', 'location', 'description', 'people', 'confirm'];
-      prompts = FIELD_PROMPTS.memory;
-    } else if (conversationState === CONVERSATION_STATES.CREATING_FAMILY) {
-      fields = ['name', 'relationship', 'notes', 'confirm'];
-      prompts = FIELD_PROMPTS.family;
-    } else if (conversationState === CONVERSATION_STATES.CREATING_REMINDER) {
-      fields = ['title', 'time', 'confirm'];
-      prompts = FIELD_PROMPTS.reminder;
-    }
-
+    // Get next field
+    const fields = FIELD_PROMPTS[conversationMode].fields;
     const currentIndex = fields.indexOf(currentField);
     const nextField = fields[currentIndex + 1];
 
     if (nextField) {
       setCurrentField(nextField);
-      
-      // For confirm, summarize what we have
-      if (nextField === 'confirm') {
-        let summary = "";
-        if (conversationState === CONVERSATION_STATES.CREATING_MEMORY) {
-          summary = `Great! Here's the memory: "${newData.title}" from ${newData.date} at ${newData.location}. ${newData.description}. `;
-        } else if (conversationState === CONVERSATION_STATES.CREATING_FAMILY) {
-          summary = `Got it! ${newData.name}, your ${newData.relationship}. ${newData.notes}. `;
-        } else if (conversationState === CONVERSATION_STATES.CREATING_REMINDER) {
-          summary = `Okay, I'll remind you: "${newData.title}" in the ${newData.time}. `;
-        }
-        speak(summary + prompts[nextField]);
-      } else {
-        speak(`Got it! ${prompts[nextField]}`);
-      }
+      speak(`Got it! ${FIELD_PROMPTS[conversationMode].prompts[nextField]}`);
+    } else {
+      // All fields collected, save
+      await saveData(newData);
     }
-    
-    setTranscript('');
   };
 
-  // Save the collected data
-  const saveData = async () => {
-    setConversationState(CONVERSATION_STATES.PROCESSING);
+  // Save collected data
+  const saveData = async (data) => {
+    setIsProcessing(true);
     
     try {
       let endpoint, body;
       
-      if (conversationState === CONVERSATION_STATES.CREATING_MEMORY) {
+      if (conversationMode === 'memory') {
         endpoint = '/api/memories';
         body = {
-          title: pendingData.title,
-          date: pendingData.date,
-          location: pendingData.location || '',
-          description: pendingData.description || '',
-          people: pendingData.people ? pendingData.people.split(/,|and/).map(p => p.trim()) : [],
+          title: data.title,
+          date: data.date,
+          location: data.location || '',
+          description: data.description || '',
+          people: data.people ? data.people.split(/,|and/).map(p => p.trim()) : [],
           photos: []
         };
-      } else if (conversationState === CONVERSATION_STATES.CREATING_FAMILY) {
+      } else if (conversationMode === 'family') {
         endpoint = '/api/family';
         body = {
-          name: pendingData.name,
-          relationship: pendingData.relationship.toLowerCase(),
-          relationship_label: `Your ${pendingData.relationship}`,
-          notes: pendingData.notes || '',
+          name: data.name,
+          relationship: data.relationship.toLowerCase(),
+          relationship_label: `Your ${data.relationship}`,
+          notes: data.notes || '',
           photos: []
         };
-      } else if (conversationState === CONVERSATION_STATES.CREATING_REMINDER) {
+      } else if (conversationMode === 'reminder') {
         endpoint = '/api/reminders';
         const timeMap = { morning: '09:00', afternoon: '14:00', evening: '18:00', night: '20:00' };
-        const time = Object.entries(timeMap).find(([k]) => pendingData.time?.toLowerCase().includes(k))?.[1] || '12:00';
-        body = {
-          title: pendingData.title,
-          time: time
-        };
+        const time = Object.entries(timeMap).find(([k]) => data.time?.toLowerCase().includes(k))?.[1] || '12:00';
+        body = { title: data.title, time };
       }
 
       const res = await fetch(`${BACKEND_URL}${endpoint}`, {
@@ -479,44 +455,42 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
       });
 
       if (res.ok) {
-        speak("Done! I've saved that for you. Is there anything else I can help with?");
+        speak(`Done! I've saved that for you. Say "Hey Mate" if you need anything else.`);
         if (onRefreshData) onRefreshData();
         toast.success('Saved successfully!');
       } else {
-        speak("I had trouble saving that. Would you like to try again?");
+        speak("I had trouble saving that. Please try again.");
       }
     } catch (error) {
-      console.error('Save error:', error);
-      speak("Something went wrong. Please try again later.");
+      speak("Something went wrong. Please try again.");
     }
 
-    setPendingData({});
+    resetConversation();
+    setIsProcessing(false);
+  };
+
+  // Reset conversation state
+  const resetConversation = () => {
+    setConversationMode(null);
     setCurrentField(null);
-    setConversationState(CONVERSATION_STATES.LISTENING_COMMAND);
+    setPendingData({});
+    setIsAwake(false);
   };
 
-  // Get status message based on state
-  const getStatusMessage = () => {
-    switch (conversationState) {
-      case CONVERSATION_STATES.IDLE:
-        return "Tap to start";
-      case CONVERSATION_STATES.LISTENING_WAKE:
-        return 'Say "Hey Mate" to talk to me';
-      case CONVERSATION_STATES.LISTENING_COMMAND:
-        return transcript || "I'm listening...";
-      case CONVERSATION_STATES.PROCESSING:
-        return "Let me think...";
-      case CONVERSATION_STATES.SPEAKING:
-        return displayText;
-      case CONVERSATION_STATES.CREATING_MEMORY:
-      case CONVERSATION_STATES.CREATING_FAMILY:
-      case CONVERSATION_STATES.CREATING_REMINDER:
-        return transcript || "I'm listening...";
-      default:
-        return "";
-    }
+  // Get status text
+  const getStatus = () => {
+    if (isProcessing) return { title: "Thinking...", subtitle: "Please wait" };
+    if (isSpeaking) return { title: "I'm speaking...", subtitle: displayText };
+    if (conversationMode) return { 
+      title: `Adding ${conversationMode}...`, 
+      subtitle: transcript || `Listening for ${currentField}...` 
+    };
+    if (isAwake) return { title: "I'm listening...", subtitle: transcript || "Tell me what you need" };
+    if (isListening) return { title: `Hello, ${userName}!`, subtitle: 'Say "Hey Mate" to talk to me' };
+    return { title: `Hello, ${userName}!`, subtitle: "Tap the microphone to start" };
   };
 
+  const status = getStatus();
   const quickActions = [
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
@@ -527,123 +501,121 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
 
   return (
     <div className="min-h-[80vh] flex flex-col items-center justify-center px-4 py-8">
-      {/* Avatar Section */}
-      <div className="relative mb-8">
-        {/* Animated rings when listening/speaking */}
-        {(conversationState === CONVERSATION_STATES.LISTENING_COMMAND || 
-          conversationState === CONVERSATION_STATES.CREATING_MEMORY ||
-          conversationState === CONVERSATION_STATES.CREATING_FAMILY ||
-          conversationState === CONVERSATION_STATES.CREATING_REMINDER) && (
+      {/* Avatar */}
+      <div className="relative mb-6">
+        {/* Animated rings */}
+        {isAwake && !isSpeaking && (
           <>
-            <div className="absolute inset-0 rounded-full bg-success/20 animate-ping" style={{ animationDuration: '2s' }} />
-            <div className="absolute inset-[-10px] rounded-full border-4 border-success/40 animate-pulse" />
+            <div className="absolute inset-[-15px] rounded-full border-4 border-success/50 animate-ping" style={{ animationDuration: '1.5s' }} />
+            <div className="absolute inset-[-8px] rounded-full border-4 border-success/70 animate-pulse" />
           </>
         )}
-        {conversationState === CONVERSATION_STATES.SPEAKING && (
+        {isSpeaking && (
           <>
-            <div className="absolute inset-0 rounded-full bg-primary/20 animate-ping" style={{ animationDuration: '1s' }} />
-            <div className="absolute inset-[-10px] rounded-full border-4 border-primary/40 animate-pulse" />
+            <div className="absolute inset-[-15px] rounded-full border-4 border-primary/50 animate-ping" style={{ animationDuration: '1s' }} />
+            <div className="absolute inset-[-8px] rounded-full border-4 border-primary/70 animate-pulse" />
           </>
         )}
-        {conversationState === CONVERSATION_STATES.LISTENING_WAKE && (
-          <div className="absolute inset-[-5px] rounded-full border-2 border-muted-foreground/30 animate-pulse" />
+        {isListening && !isAwake && !isSpeaking && (
+          <div className="absolute inset-[-5px] rounded-full border-2 border-muted-foreground/40 animate-pulse" />
         )}
         
-        {/* Avatar Image */}
+        {/* Avatar image */}
         <div 
           className={`
-            relative w-48 h-48 md:w-56 md:h-56 rounded-full overflow-hidden
-            border-4 shadow-elevated cursor-pointer transition-all duration-300
-            ${conversationState === CONVERSATION_STATES.SPEAKING ? 'border-primary scale-105' : ''}
-            ${conversationState === CONVERSATION_STATES.LISTENING_COMMAND ? 'border-success scale-105' : ''}
-            ${conversationState === CONVERSATION_STATES.LISTENING_WAKE ? 'border-muted hover:border-primary' : ''}
-            ${conversationState === CONVERSATION_STATES.IDLE ? 'border-muted hover:border-primary' : ''}
+            relative w-44 h-44 md:w-52 md:h-52 rounded-full overflow-hidden cursor-pointer
+            border-4 shadow-elevated transition-all duration-300
+            ${isSpeaking ? 'border-primary scale-105' : ''}
+            ${isAwake && !isSpeaking ? 'border-success scale-105' : ''}
+            ${isListening && !isAwake && !isSpeaking ? 'border-muted-foreground/50' : ''}
+            ${!isListening ? 'border-muted hover:border-primary hover:scale-102' : ''}
           `}
           onClick={() => {
             if (!isListening) {
               startListening();
-            } else if (conversationState === CONVERSATION_STATES.LISTENING_WAKE) {
-              setConversationState(CONVERSATION_STATES.LISTENING_COMMAND);
-              speak("Yes, I'm here. How can I help you?");
+            } else if (!isAwake && !isSpeaking) {
+              setIsAwake(true);
+              speak("Yes, how can I help you?");
             }
           }}
         >
-          <img 
-            src={AVATAR_URL} 
-            alt="Memory Companion"
-            className="w-full h-full object-cover"
-          />
+          <img src={AVATAR_URL} alt="Memory Companion" className="w-full h-full object-cover" />
           
-          {/* Microphone indicator */}
-          {isListening && (
-            <div className="absolute bottom-2 right-2 bg-background rounded-full p-2 shadow-lg">
-              <Mic className={`h-5 w-5 ${conversationState === CONVERSATION_STATES.LISTENING_COMMAND ? 'text-success animate-pulse' : 'text-muted-foreground'}`} />
-            </div>
-          )}
+          {/* Mic indicator */}
+          <div className={`absolute bottom-1 right-1 rounded-full p-2 shadow-lg transition-colors ${
+            isAwake ? 'bg-success' : isListening ? 'bg-background' : 'bg-muted'
+          }`}>
+            {isProcessing ? (
+              <Loader2 className="h-4 w-4 animate-spin text-primary" />
+            ) : (
+              <Mic className={`h-4 w-4 ${isAwake ? 'text-white animate-pulse' : isListening ? 'text-muted-foreground' : 'text-muted-foreground'}`} />
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Status Message */}
-      <div className="text-center mb-8 max-w-md">
-        <h2 className="text-2xl md:text-3xl font-bold text-foreground mb-3">
-          {conversationState === CONVERSATION_STATES.SPEAKING ? "I'm speaking..." :
-           conversationState === CONVERSATION_STATES.LISTENING_COMMAND ? "I'm listening..." :
-           conversationState === CONVERSATION_STATES.PROCESSING ? "Thinking..." :
-           conversationState === CONVERSATION_STATES.CREATING_MEMORY ? "Creating memory..." :
-           conversationState === CONVERSATION_STATES.CREATING_FAMILY ? "Adding family..." :
-           conversationState === CONVERSATION_STATES.CREATING_REMINDER ? "Setting reminder..." :
-           `Hello, ${userName}!`}
-        </h2>
-        <p className={`text-lg md:text-xl ${
-          conversationState === CONVERSATION_STATES.SPEAKING ? 'text-primary' :
-          conversationState === CONVERSATION_STATES.LISTENING_COMMAND ? 'text-success' :
-          'text-muted-foreground'
-        }`}>
-          {getStatusMessage()}
+      {/* Status */}
+      <div className="text-center mb-6 max-w-lg">
+        <h2 className="text-2xl md:text-3xl font-bold text-foreground mb-2">{status.title}</h2>
+        <p className={`text-lg md:text-xl ${isSpeaking ? 'text-primary' : isAwake ? 'text-success' : 'text-muted-foreground'}`}>
+          {status.subtitle}
         </p>
+        
+        {/* Live transcript indicator */}
+        {transcript && (isAwake || conversationMode) && (
+          <div className="mt-3 p-3 bg-success/10 rounded-xl border border-success/30">
+            <p className="text-success font-medium">🎤 "{transcript}"</p>
+          </div>
+        )}
       </div>
 
-      {/* Control Buttons */}
-      <div className="flex items-center gap-4 mb-10">
+      {/* Controls */}
+      <div className="flex items-center gap-3 mb-8">
         <Button
           variant={isListening ? "destructive" : "accessible"}
           size="lg"
           className="gap-2 text-lg px-8 py-6"
           onClick={() => isListening ? stopListening() : startListening()}
+          data-testid="mic-toggle-btn"
         >
-          {isListening ? (
-            <>
-              <MicOff className="h-6 w-6" />
-              Stop
-            </>
-          ) : (
-            <>
-              <Mic className="h-6 w-6" />
-              Start Listening
-            </>
-          )}
+          {isListening ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
+          {isListening ? 'Stop' : 'Start Listening'}
         </Button>
         
         <Button
           variant="outline"
           size="lg"
-          className="px-6 py-6"
+          className="px-5 py-6"
           onClick={() => setAudioEnabled(!audioEnabled)}
         >
           {audioEnabled ? <Volume2 className="h-6 w-6" /> : <VolumeX className="h-6 w-6" />}
         </Button>
+
+        {isSpeaking && (
+          <Button variant="outline" size="lg" className="px-5 py-6" onClick={stopSpeaking}>
+            Stop
+          </Button>
+        )}
       </div>
 
-      {/* Quick Actions - Backup buttons */}
+      {/* Mic permission warning */}
+      {micPermission === 'denied' && (
+        <div className="mb-6 p-4 bg-destructive/10 rounded-xl border border-destructive/30 max-w-md text-center">
+          <p className="text-destructive font-medium">⚠️ Microphone access is blocked</p>
+          <p className="text-sm text-muted-foreground mt-1">Please enable it in your browser settings to use voice commands</p>
+        </div>
+      )}
+
+      {/* Quick actions */}
       <div className="w-full max-w-2xl">
-        <p className="text-center text-sm text-muted-foreground mb-4">Or tap to go directly:</p>
-        <div className="flex flex-wrap justify-center gap-3">
+        <p className="text-center text-sm text-muted-foreground mb-3">Or tap to go directly:</p>
+        <div className="flex flex-wrap justify-center gap-2">
           {quickActions.map((action) => (
             <Button
               key={action.id}
               variant="outline"
               size="lg"
-              className="gap-2 px-6"
+              className="gap-2"
               onClick={() => onNavigate(action.id)}
             >
               <action.icon className="h-5 w-5" />
@@ -653,24 +625,18 @@ export const AICompanion = ({ onNavigate, userName = "Friend", onRefreshData }) 
         </div>
       </div>
 
-      {/* Suggested Commands */}
-      <div className="mt-10 text-center">
+      {/* Suggestions */}
+      <div className="mt-8 text-center">
         <p className="text-sm text-muted-foreground mb-3">Try saying:</p>
-        <div className="flex flex-wrap justify-center gap-2">
-          {[
-            "Add a new memory",
-            "Who is in my family?",
-            "What did I do yesterday?",
-            "Add a family member",
-            "Set a reminder"
-          ].map((suggestion) => (
-            <span 
-              key={suggestion}
-              className="bg-muted px-3 py-1 rounded-full text-sm text-foreground cursor-pointer hover:bg-muted/80 transition-colors"
-              onClick={() => processCommand(suggestion)}
+        <div className="flex flex-wrap justify-center gap-2 max-w-xl">
+          {["Add a new memory", "Who is in my family?", "What did I do yesterday?", "Add a family member", "Set a reminder"].map((cmd) => (
+            <button
+              key={cmd}
+              onClick={() => { setIsAwake(true); processCommand(cmd); }}
+              className="bg-muted hover:bg-muted/80 px-3 py-1.5 rounded-full text-sm transition-colors"
             >
-              "{suggestion}"
-            </span>
+              "{cmd}"
+            </button>
           ))}
         </div>
       </div>
