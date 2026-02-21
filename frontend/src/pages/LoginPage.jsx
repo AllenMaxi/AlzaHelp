@@ -1,40 +1,92 @@
-import React from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/context/AuthContext';
-import { Button } from '@/components/ui/button';
-import { Heart, LogIn, Users, Calendar, MessageCircle, Shield } from 'lucide-react';
+import React from "react";
+import { useNavigate } from "react-router-dom";
+import { useAuth } from "@/context/AuthContext";
+import { Button } from "@/components/ui/button";
+import {
+  Heart,
+  LogIn,
+  Users,
+  Calendar,
+  MessageCircle,
+  Shield
+} from "lucide-react";
 
 export const LoginPage = () => {
-  const { login, isAuthenticated } = useAuth();
+  const { login, register, isAuthenticated } = useAuth();
   const navigate = useNavigate();
+  const [isLogin, setIsLogin] = React.useState(true);
+  const [isLoading, setIsLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [successMessage, setSuccessMessage] = React.useState("");
+  const [formData, setFormData] = React.useState({
+    email: "",
+    password: "",
+    name: "",
+    role: "patient"
+  });
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setIsLoading(true);
+    setError("");
+    setSuccessMessage("");
+
+    try {
+      if (isLogin) {
+        await login(formData.email, formData.password);
+        navigate("/dashboard");
+      } else {
+        const registration = await register(formData.email, formData.password, formData.name, formData.role);
+        if (registration?.requires_approval) {
+          setSuccessMessage(
+            registration.message || "Registration submitted. Your account is pending admin approval."
+          );
+          setIsLogin(true);
+          setFormData({
+            email: formData.email,
+            password: "",
+            name: "",
+            role: "patient"
+          });
+          return;
+        }
+        await login(formData.email, formData.password);
+        navigate("/dashboard");
+      }
+    } catch (err) {
+      setError(err.message || "An error occurred. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   // Redirect if already authenticated
   React.useEffect(() => {
     if (isAuthenticated) {
-      navigate('/dashboard');
+      navigate("/dashboard");
     }
   }, [isAuthenticated, navigate]);
 
   const features = [
     {
       icon: Users,
-      title: 'Family Directory',
-      description: 'Keep all your loved ones\' information in one safe place'
+      title: "Family Directory",
+      description: "Keep all your loved ones' information in one safe place"
     },
     {
       icon: Calendar,
-      title: 'Memory Timeline',
-      description: 'Store and relive your precious memories anytime'
+      title: "Memory Timeline",
+      description: "Store and relive your precious memories anytime"
     },
     {
       icon: MessageCircle,
-      title: 'AI Assistant',
-      description: 'Ask questions about your family and memories'
+      title: "AI Assistant",
+      description: "Ask questions about your family and memories"
     },
     {
       icon: Shield,
-      title: 'Safe & Private',
-      description: 'Your memories are protected and only visible to you'
+      title: "Safe & Private",
+      description: "Your memories are protected and only visible to you"
     }
   ];
 
@@ -45,11 +97,18 @@ export const LoginPage = () => {
         <div className="container mx-auto flex items-center justify-center sm:justify-start">
           <div className="flex items-center gap-3">
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary shadow-soft">
-              <Heart className="h-7 w-7 text-primary-foreground" fill="currentColor" />
+              <Heart
+                className="h-7 w-7 text-primary-foreground"
+                fill="currentColor"
+              />
             </div>
             <div>
-              <h1 className="text-2xl font-bold text-foreground font-display">MemoryKeeper</h1>
-              <p className="text-sm text-muted-foreground">Your memories, always close</p>
+              <h1 className="text-2xl font-bold text-foreground font-display">
+                MemoryKeeper
+              </h1>
+              <p className="text-sm text-muted-foreground">
+                Your memories, always close
+              </p>
             </div>
           </div>
         </div>
@@ -58,39 +117,143 @@ export const LoginPage = () => {
       {/* Main Content */}
       <main className="container mx-auto px-4 sm:px-6 lg:px-8 py-12 sm:py-20">
         <div className="grid gap-12 lg:grid-cols-2 lg:gap-20 items-center">
-          {/* Left - Welcome Text */}
-          <div className="text-center lg:text-left">
-            <div className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-4 py-2 mb-6">
-              <Heart className="h-5 w-5 text-primary" fill="currentColor" />
-              <span className="text-base font-medium text-primary">Welcome</span>
-            </div>
-            
-            <h2 className="font-display text-4xl sm:text-5xl lg:text-6xl font-bold text-foreground leading-tight mb-6">
-              Keep Your <span className="text-primary">Memories</span> Safe
-            </h2>
-            
-            <p className="text-accessible text-muted-foreground max-w-xl mx-auto lg:mx-0 mb-8">
-              MemoryKeeper helps you store and remember your loved ones, special moments, 
-              and important information. Sign in with one click to get started.
-            </p>
+          {/* Left - Auth Form */}
+          <div className="max-w-md mx-auto lg:mx-0 w-full animate-fade-in">
+            <div className="bg-card border-2 border-border rounded-3xl p-8 shadow-card">
+              <div className="text-center mb-8">
+                <h2 className="text-2xl font-bold text-foreground mb-2">
+                  {isLogin ? "Welcome Back" : "Create Account"}
+                </h2>
+                <p className="text-muted-foreground">
+                  {isLogin
+                    ? "Enter your details to access your memories"
+                    : "Start preserving your memories today"}
+                </p>
+              </div>
 
-            <Button 
-              variant="accessible" 
-              size="xl"
-              onClick={login}
-              className="gap-3 w-full sm:w-auto"
-            >
-              <LogIn className="h-7 w-7" />
-              Sign in with Google
-            </Button>
-            
-            <p className="text-sm text-muted-foreground mt-4">
-              Easy one-click sign in • No password needed
-            </p>
+              {error && (
+                <div className="mb-6 p-4 rounded-xl bg-destructive/10 text-destructive text-sm font-medium animate-shake">
+                  {error}
+                </div>
+              )}
+
+              {successMessage && (
+                <div className="mb-6 p-4 rounded-xl bg-primary/10 text-primary text-sm font-medium">
+                  {successMessage}
+                </div>
+              )}
+
+              <form onSubmit={handleSubmit} className="space-y-4">
+                {!isLogin && (
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
+                      Full Name
+                    </label>
+                    <input
+                      type="text"
+                      className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                      placeholder="e.g. John Doe"
+                      value={formData.name}
+                      onChange={(e) =>
+                        setFormData({ ...formData, name: e.target.value })
+                      }
+                      required={!isLogin}
+                    />
+                  </div>
+                )}
+
+                {!isLogin && (
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
+                      Account Role
+                    </label>
+                    <select
+                      className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                      value={formData.role}
+                      onChange={(e) =>
+                        setFormData({ ...formData, role: e.target.value })
+                      }
+                    >
+                      <option value="patient">Patient</option>
+                      <option value="caregiver">Caregiver</option>
+                      <option value="clinician">Clinician</option>
+                      <option value="admin">Admin (Allowlisted)</option>
+                    </select>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                    placeholder="john@example.com"
+                    value={formData.email}
+                    onChange={(e) =>
+                      setFormData({ ...formData, email: e.target.value })
+                    }
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
+                    Password
+                  </label>
+                  <input
+                    type="password"
+                    className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                    placeholder="••••••••"
+                    value={formData.password}
+                    onChange={(e) =>
+                      setFormData({ ...formData, password: e.target.value })
+                    }
+                    required
+                    minLength={6}
+                  />
+                </div>
+
+                <Button
+                  type="submit"
+                  size="xl"
+                  className="w-full mt-6"
+                  disabled={isLoading}
+                >
+                  {isLoading ? (
+                    <span className="flex items-center gap-2">
+                      Processing...
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <LogIn className="h-5 w-5" />
+                      {isLogin ? "Sign In" : "Create Account"}
+                    </span>
+                  )}
+                </Button>
+              </form>
+
+              <div className="mt-6 text-center">
+                <button
+                  onClick={() => {
+                    setIsLogin(!isLogin);
+                    setError("");
+                    setSuccessMessage("");
+                    setFormData({ email: "", password: "", name: "", role: "patient" });
+                  }}
+                  className="text-sm font-medium text-primary hover:text-primary/80 transition-colors"
+                >
+                  {isLogin
+                    ? "Don't have an account? Sign up"
+                    : "Already have an account? Sign in"}
+                </button>
+              </div>
+            </div>
           </div>
 
           {/* Right - Features */}
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="hidden lg:grid gap-4 sm:grid-cols-2">
             {features.map((feature, index) => {
               const Icon = feature.icon;
               return (
@@ -102,8 +265,12 @@ export const LoginPage = () => {
                   <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-primary/10 mb-4">
                     <Icon className="h-7 w-7 text-primary" />
                   </div>
-                  <h3 className="text-xl font-bold text-foreground mb-2">{feature.title}</h3>
-                  <p className="text-base text-muted-foreground">{feature.description}</p>
+                  <h3 className="text-xl font-bold text-foreground mb-2">
+                    {feature.title}
+                  </h3>
+                  <p className="text-base text-muted-foreground">
+                    {feature.description}
+                  </p>
                 </div>
               );
             })}
@@ -131,7 +298,9 @@ export const LoginPage = () => {
         <div className="container mx-auto px-4 sm:px-6 lg:px-8 text-center">
           <div className="flex items-center justify-center gap-2 mb-3">
             <Heart className="h-5 w-5 text-primary" fill="currentColor" />
-            <span className="font-display text-xl font-bold text-foreground">MemoryKeeper</span>
+            <span className="font-display text-xl font-bold text-foreground">
+              MemoryKeeper
+            </span>
           </div>
           <p className="text-base text-muted-foreground">
             Made with love to help you remember what matters most.

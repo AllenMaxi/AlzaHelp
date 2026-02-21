@@ -8,6 +8,7 @@ export const AuthCallback = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const hasProcessed = useRef(false);
+  const hash = location.hash;
 
   useEffect(() => {
     // Prevent double processing in StrictMode
@@ -16,7 +17,6 @@ export const AuthCallback = () => {
 
     const processAuth = async () => {
       // Extract session_id from URL hash
-      const hash = location.hash;
       const sessionIdMatch = hash.match(/session_id=([^&]+)/);
       
       if (sessionIdMatch) {
@@ -35,7 +35,7 @@ export const AuthCallback = () => {
     };
 
     processAuth();
-  }, []);
+  }, [hash, navigate, processSessionId]);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-hero">

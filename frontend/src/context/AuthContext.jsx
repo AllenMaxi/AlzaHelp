@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect } from "react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 
@@ -7,7 +7,7 @@ const AuthContext = createContext(null);
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
+    throw new Error("useAuth must be used within an AuthProvider");
   }
   return context;
 };
@@ -25,9 +25,9 @@ export const AuthProvider = ({ children }) => {
   const checkAuth = async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/api/auth/me`, {
-        credentials: 'include',
+        credentials: "include"
       });
-      
+
       if (response.ok) {
         const userData = await response.json();
         setUser(userData);
@@ -37,7 +37,7 @@ export const AuthProvider = ({ children }) => {
         setIsAuthenticated(false);
       }
     } catch (error) {
-      console.error('Auth check failed:', error);
+      console.error("Auth check failed:", error);
       setUser(null);
       setIsAuthenticated(false);
     } finally {
@@ -45,33 +45,51 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
-  const login = () => {
-    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    const redirectUrl = window.location.origin + '/auth/callback';
-    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
-  };
-
-  const processSessionId = async (sessionId) => {
+  const login = async (email, password) => {
     try {
-      const response = await fetch(`${BACKEND_URL}/api/auth/session`, {
-        method: 'POST',
+      const response = await fetch(`${BACKEND_URL}/api/auth/login`, {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
+          "Content-Type": "application/json"
         },
-        credentials: 'include',
-        body: JSON.stringify({ session_id: sessionId }),
+        credentials: "include",
+        body: JSON.stringify({ email, password })
       });
 
       if (response.ok) {
         const data = await response.json();
         setUser(data.user);
         setIsAuthenticated(true);
-        return data.user;
+        return { success: true };
       } else {
-        throw new Error('Session processing failed');
+        const error = await response.json();
+        throw new Error(error.detail || "Login failed");
       }
     } catch (error) {
-      console.error('Session processing error:', error);
+      console.error("Login error:", error);
+      throw error;
+    }
+  };
+
+  const register = async (email, password, name, role = "patient") => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/auth/register`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ email, password, name, role })
+      });
+
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return { success: true, ...data };
+      } else {
+        const error = await response.json();
+        throw new Error(error.detail || "Registration failed");
+      }
+    } catch (error) {
+      console.error("Registration error:", error);
       throw error;
     }
   };
@@ -79,11 +97,11 @@ export const AuthProvider = ({ children }) => {
   const logout = async () => {
     try {
       await fetch(`${BACKEND_URL}/api/auth/logout`, {
-        method: 'POST',
-        credentials: 'include',
+        method: "POST",
+        credentials: "include"
       });
     } catch (error) {
-      console.error('Logout error:', error);
+      console.error("Logout error:", error);
     } finally {
       setUser(null);
       setIsAuthenticated(false);
@@ -91,15 +109,17 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ 
-      user, 
-      loading, 
-      isAuthenticated, 
-      login, 
-      logout, 
-      processSessionId,
-      checkAuth 
-    }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        isAuthenticated,
+        login,
+        register,
+        logout,
+        checkAuth
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );

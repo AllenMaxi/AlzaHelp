@@ -8,9 +8,16 @@ import { AssistantSection } from "@/components/sections/AssistantSection";
 import { RemindersSection } from "@/components/sections/RemindersSection";
 import { WhoIsThisQuiz } from "@/components/sections/WhoIsThisQuiz";
 import { WeekMemories } from "@/components/sections/WeekMemories";
+import { MemoryCardGame } from "@/components/sections/MemoryCardGame";
+import { SudokuGame } from "@/components/sections/SudokuGame";
+import { NavigationSection } from "@/components/sections/NavigationSection";
+import { MedicationSection } from "@/components/sections/MedicationSection";
+import { CaregiverPortalSection } from "@/components/sections/CaregiverPortalSection";
+import { AdminSection } from "@/components/sections/AdminSection";
+import { MoodBehaviorSection } from "@/components/sections/MoodBehaviorSection";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Users, Calendar, MessageCircle, Bell, Brain, CalendarDays, Home, Heart } from "lucide-react";
-import { familyApi, memoriesApi, remindersApi } from "@/services/api";
+import { Users, Calendar, MessageCircle, Bell, Brain, CalendarDays, Home, Heart, Layers, Grid3X3, Route, Pill, ShieldCheck, Shield, Smile } from "lucide-react";
+import { familyApi, memoriesApi, remindersApi, destinationsApi, medicationsApi } from "@/services/api";
 
 export const DashboardPage = () => {
   const { user } = useAuth();
@@ -22,6 +29,8 @@ export const DashboardPage = () => {
   const [familyMembers, setFamilyMembers] = useState([]);
   const [memories, setMemories] = useState([]);
   const [reminders, setReminders] = useState([]);
+  const [destinations, setDestinations] = useState([]);
+  const [medications, setMedications] = useState([]);
   const [loading, setLoading] = useState(true);
 
   // Apply dark mode
@@ -41,14 +50,18 @@ export const DashboardPage = () => {
   const loadAllData = async () => {
     setLoading(true);
     try {
-      const [familyData, memoriesData, remindersData] = await Promise.all([
+      const [familyData, memoriesData, remindersData, destinationsData, medicationsData] = await Promise.all([
         familyApi.getAll().catch(() => []),
         memoriesApi.getAll().catch(() => []),
         remindersApi.getAll().catch(() => []),
+        destinationsApi.getAll().catch(() => []),
+        medicationsApi.getAll().catch(() => []),
       ]);
       setFamilyMembers(familyData);
       setMemories(memoriesData);
       setReminders(remindersData);
+      setDestinations(destinationsData);
+      setMedications(medicationsData);
     } catch (error) {
       console.error('Error loading data:', error);
     } finally {
@@ -71,6 +84,16 @@ export const DashboardPage = () => {
     setReminders(data);
   };
 
+  const refreshDestinations = async () => {
+    const data = await destinationsApi.getAll().catch(() => []);
+    setDestinations(data);
+  };
+
+  const refreshMedications = async () => {
+    const data = await medicationsApi.getAll().catch(() => []);
+    setMedications(data);
+  };
+
   // Voice assistant navigation handler
   const handleVoiceNavigate = useCallback((target) => {
     if (target === 'home') {
@@ -84,10 +107,17 @@ export const DashboardPage = () => {
   const tabItems = [
     { id: 'family', label: 'Family', icon: Users },
     { id: 'timeline', label: 'Memories', icon: Calendar },
-    { id: 'quiz', label: 'Quiz', icon: Brain },
+    { id: 'quiz', label: 'Faces Quiz', icon: Brain },
+    { id: 'cards', label: 'Match', icon: Layers },
+    { id: 'sudoku', label: 'Sudoku', icon: Grid3X3 },
     { id: 'week', label: 'My Week', icon: CalendarDays },
     { id: 'assistant', label: 'Ask Me', icon: MessageCircle },
     { id: 'reminders', label: 'Today', icon: Bell },
+    { id: 'mood', label: 'Mood', icon: Smile },
+    { id: 'navigation', label: 'Go To', icon: Route },
+    { id: 'medications', label: 'Meds', icon: Pill },
+    { id: 'caregiver', label: 'Caregiver', icon: ShieldCheck },
+    ...(user?.role === 'admin' ? [{ id: 'admin', label: 'Admin', icon: Shield }] : []),
   ];
 
   return (
@@ -174,9 +204,19 @@ export const DashboardPage = () => {
             </TabsContent>
 
             <TabsContent value="quiz" className="mt-0 animate-fade-in">
-              <WhoIsThisQuiz 
+              <WhoIsThisQuiz
                 familyMembers={familyMembers}
               />
+            </TabsContent>
+
+            <TabsContent value="cards" className="mt-0 animate-fade-in">
+              <MemoryCardGame
+                familyMembers={familyMembers}
+              />
+            </TabsContent>
+
+            <TabsContent value="sudoku" className="mt-0 animate-fade-in">
+              <SudokuGame />
             </TabsContent>
 
             <TabsContent value="week" className="mt-0 animate-fade-in">
@@ -198,6 +238,39 @@ export const DashboardPage = () => {
                 reminders={reminders}
                 onRefresh={refreshReminders}
                 loading={loading}
+              />
+            </TabsContent>
+
+            <TabsContent value="mood" className="mt-0 animate-fade-in">
+              <MoodBehaviorSection />
+            </TabsContent>
+
+            <TabsContent value="navigation" className="mt-0 animate-fade-in">
+              <NavigationSection
+                destinations={destinations}
+                onRefresh={refreshDestinations}
+                loading={loading}
+              />
+            </TabsContent>
+
+            <TabsContent value="medications" className="mt-0 animate-fade-in">
+              <MedicationSection
+                medications={medications}
+                onRefresh={refreshMedications}
+                loading={loading}
+              />
+            </TabsContent>
+
+            <TabsContent value="caregiver" className="mt-0 animate-fade-in">
+              <CaregiverPortalSection
+                user={user}
+                onNavigate={handleVoiceNavigate}
+              />
+            </TabsContent>
+
+            <TabsContent value="admin" className="mt-0 animate-fade-in">
+              <AdminSection
+                user={user}
               />
             </TabsContent>
           </Tabs>

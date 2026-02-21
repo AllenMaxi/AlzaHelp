@@ -1,269 +1,332 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, Volume2, VolumeX, X, Loader2, Sparkles } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { toast } from 'sonner';
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Mic,
+  MicOff,
+  Volume2,
+  VolumeX,
+  X,
+  Loader2,
+  Sparkles
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const WAKE_WORD = "hey memory";
+const WAKE_COOLDOWN_MS = 3000;
+const SESSION_TIMEOUT_MS = 60000;
+const RESTART_DELAY_MS = 600;
 
 export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [transcript, setTranscript] = useState('');
-  const [response, setResponse] = useState('');
-  const [wakeWordDetected, setWakeWordDetected] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [response, setResponse] = useState("");
+  const [sessionActive, setSessionActive] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [sessionId] = useState(() => `voice_${Date.now()}`);
-  
+
   const recognitionRef = useRef(null);
   const audioRef = useRef(null);
-  const silenceTimeoutRef = useRef(null);
+  const sessionTimeoutRef = useRef(null);
+  const wakeWordCooldownRef = useRef(false);
+  const lastProcessedRef = useRef("");
+  const processingLockRef = useRef(false);
 
-  // Initialize speech recognition
+  // Refs to access latest state inside recognition callbacks without re-creating recognition
+  const stateRef = useRef({
+    isListening: false,
+    isSpeaking: false,
+    isProcessing: false,
+    sessionActive: false,
+    audioEnabled: true
+  });
+
   useEffect(() => {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      console.warn('Speech recognition not supported');
-      return;
-    }
+    stateRef.current = { isListening, isSpeaking, isProcessing, sessionActive, audioEnabled };
+  }, [isListening, isSpeaking, isProcessing, sessionActive, audioEnabled]);
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
+  // Stable ref for callbacks that change
+  const onNavigateRef = useRef(onNavigate);
+  useEffect(() => { onNavigateRef.current = onNavigate; }, [onNavigate]);
 
-    recognition.onresult = (event) => {
-      let finalTranscript = '';
-      let interimTranscript = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript;
-        } else {
-          interimTranscript += transcript;
-        }
+  // Reset session timeout — keeps session alive for 60s after last interaction
+  const resetSessionTimeout = useCallback(() => {
+    if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current);
+    sessionTimeoutRef.current = setTimeout(() => {
+      if (!stateRef.current.isSpeaking && !stateRef.current.isProcessing) {
+        setSessionActive(false);
+        setTranscript("");
+        wakeWordCooldownRef.current = false;
       }
+    }, SESSION_TIMEOUT_MS);
+  }, []);
 
-      const currentTranscript = (finalTranscript || interimTranscript).toLowerCase();
-      
-      // Check for wake word
-      if (!wakeWordDetected && currentTranscript.includes(WAKE_WORD)) {
-        setWakeWordDetected(true);
-        setIsExpanded(true);
-        setTranscript('');
-        speak("Yes, I'm listening. How can I help you?");
-        return;
-      }
+  // Text-to-speech using OpenAI TTS (stable — uses refs)
+  const speak = useCallback(async (text) => {
+    if (!text) return;
 
-      // If wake word was detected, capture the command
-      if (wakeWordDetected && finalTranscript) {
-        // Remove wake word from transcript
-        const command = finalTranscript.replace(/hey memory/gi, '').trim();
-        if (command.length > 2) {
-          setTranscript(command);
-          processCommand(command);
-          setWakeWordDetected(false);
-        }
-      } else if (wakeWordDetected) {
-        setTranscript(interimTranscript.replace(/hey memory/gi, '').trim());
-        
-        // Reset silence timeout
-        if (silenceTimeoutRef.current) {
-          clearTimeout(silenceTimeoutRef.current);
-        }
-        silenceTimeoutRef.current = setTimeout(() => {
-          if (wakeWordDetected && !isProcessing) {
-            setWakeWordDetected(false);
-            setTranscript('');
-          }
-        }, 5000);
-      }
-    };
-
-    recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
-      if (event.error !== 'no-speech') {
-        setIsListening(false);
-      }
-    };
-
-    recognition.onend = () => {
-      // Restart if we should still be listening
-      if (isListening) {
-        try {
-          recognition.start();
-        } catch (e) {
-          console.error('Failed to restart recognition:', e);
-        }
-      }
-    };
-
-    recognitionRef.current = recognition;
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-      if (silenceTimeoutRef.current) {
-        clearTimeout(silenceTimeoutRef.current);
-      }
-    };
-  }, [wakeWordDetected, isProcessing, isListening]);
-
-  // Start/stop listening
-  const toggleListening = useCallback(() => {
-    if (isListening) {
-      recognitionRef.current?.stop();
-      setIsListening(false);
-      setWakeWordDetected(false);
-      setTranscript('');
-    } else {
-      try {
-        recognitionRef.current?.start();
-        setIsListening(true);
-        toast.success('Voice assistant activated. Say "Hey Memory" to start!');
-      } catch (e) {
-        console.error('Failed to start recognition:', e);
-        toast.error('Could not start voice recognition');
-      }
-    }
-  }, [isListening]);
-
-  // Text-to-speech using OpenAI TTS
-  const speak = async (text) => {
-    if (!audioEnabled || !text) return;
-    
     setIsSpeaking(true);
     setResponse(text);
 
+    // Stop recognition while speaking to avoid hearing ourselves
+    try { recognitionRef.current?.stop(); } catch (e) {}
+
+    const onComplete = () => {
+      setIsSpeaking(false);
+      // Resume recognition after TTS finishes
+      setTimeout(() => {
+        if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
+          try { recognitionRef.current?.start(); } catch (e) {}
+        }
+      }, RESTART_DELAY_MS);
+    };
+
+    if (!stateRef.current.audioEnabled) {
+      setTimeout(onComplete, Math.min(text.length * 50, 4000));
+      return;
+    }
+
     try {
       const res = await fetch(`${BACKEND_URL}/api/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ text, voice: 'nova' })
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ text, voice: "nova" })
       });
 
       if (res.ok) {
         const data = await res.json();
         const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
         audioRef.current = audio;
-        
-        audio.onended = () => {
-          setIsSpeaking(false);
-        };
-        
-        audio.onerror = () => {
-          setIsSpeaking(false);
-          // Fallback to browser TTS
-          fallbackSpeak(text);
-        };
-        
+        audio.onended = onComplete;
+        audio.onerror = () => fallbackSpeak(text, onComplete);
         await audio.play();
       } else {
-        // Fallback to browser TTS
-        fallbackSpeak(text);
+        fallbackSpeak(text, onComplete);
       }
     } catch (error) {
-      console.error('TTS error:', error);
-      fallbackSpeak(text);
+      console.error("TTS error:", error);
+      fallbackSpeak(text, onComplete);
     }
-  };
+  }, []);
 
   // Fallback browser TTS
-  const fallbackSpeak = (text) => {
-    if ('speechSynthesis' in window) {
+  const fallbackSpeak = (text, onComplete) => {
+    if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 0.85;
-      utterance.onend = () => setIsSpeaking(false);
+      utterance.onend = onComplete;
+      utterance.onerror = onComplete;
       window.speechSynthesis.speak(utterance);
     } else {
-      setIsSpeaking(false);
+      onComplete();
     }
   };
 
   // Stop speaking
-  const stopSpeaking = () => {
+  const stopSpeaking = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
-    if ('speechSynthesis' in window) {
+    if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
     setIsSpeaking(false);
-  };
+  }, []);
 
-  // Process voice command
-  const processCommand = async (command) => {
+  // Process voice command (stable — uses refs)
+  const processCommand = useCallback(async (command) => {
     if (!command.trim()) return;
-    
+
     setIsProcessing(true);
-    
+    resetSessionTimeout();
+
     try {
       const res = await fetch(`${BACKEND_URL}/api/voice-command`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ text: command, session_id: sessionId })
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ text: command, session_id: stateRef.current.sessionId })
       });
 
       if (res.ok) {
         const data = await res.json();
-        
-        // Handle navigation
-        if (data.action === 'navigate' && onNavigate) {
+        const nav = onNavigateRef.current;
+
+        if (data.action === "navigate" && nav) {
           speak(data.response);
-          setTimeout(() => {
-            onNavigate(data.target);
-          }, 1500);
-        } 
-        // Handle create actions
-        else if (data.action === 'create_memory') {
+          setTimeout(() => nav(data.target), 1500);
+        } else if (data.action === "create_memory") {
           speak(data.response);
-          setTimeout(() => {
-            onNavigate('timeline');
-          }, 1500);
-        }
-        else if (data.action === 'create_reminder') {
+          setTimeout(() => nav?.("timeline"), 1500);
+        } else if (data.action === "create_reminder") {
           speak(data.response);
-          setTimeout(() => {
-            onNavigate('reminders');
-          }, 1500);
-        }
-        else if (data.action === 'create_family') {
+          setTimeout(() => nav?.("reminders"), 1500);
+        } else if (data.action === "create_family") {
           speak(data.response);
-          setTimeout(() => {
-            onNavigate('family');
-          }, 1500);
-        }
-        // Just speak the response
-        else {
+          setTimeout(() => nav?.("family"), 1500);
+        } else {
           speak(data.response);
         }
       } else {
         speak("I'm sorry, I couldn't understand that. Could you try again?");
       }
     } catch (error) {
-      console.error('Voice command error:', error);
+      console.error("Voice command error:", error);
       speak("I'm having trouble connecting. Please try again.");
     } finally {
       setIsProcessing(false);
-      setTranscript('');
+      setTranscript("");
     }
-  };
+  }, [speak, resetSessionTimeout]);
 
-  // Manual command input (for accessibility)
-  const handleManualCommand = () => {
-    if (transcript.trim()) {
-      processCommand(transcript);
+  // Initialize speech recognition ONCE (no state in deps — all accessed via refs)
+  useEffect(() => {
+    if (
+      !("webkitSpeechRecognition" in window) &&
+      !("SpeechRecognition" in window)
+    ) {
+      console.warn("Speech recognition not supported");
+      return;
     }
-  };
+
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      const { isSpeaking, sessionActive, isProcessing } = stateRef.current;
+
+      // Skip if speaking to avoid processing TTS output
+      if (isSpeaking) return;
+
+      let finalTranscript = "";
+      let interimTranscript = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += t;
+        } else {
+          interimTranscript += t;
+        }
+      }
+
+      const heard = (finalTranscript || interimTranscript).toLowerCase();
+
+      // PHASE 1: Check for wake word if session is NOT active
+      if (!sessionActive && !wakeWordCooldownRef.current && heard.includes(WAKE_WORD)) {
+        console.log("Wake word detected — activating session");
+
+        // Brief cooldown to prevent double-trigger
+        wakeWordCooldownRef.current = true;
+        setTimeout(() => { wakeWordCooldownRef.current = false; }, WAKE_COOLDOWN_MS);
+
+        setSessionActive(true);
+        setIsExpanded(true);
+        setTranscript("");
+
+        // Stop recognition to clear buffer, speak will restart it
+        try { recognition.stop(); } catch (e) {}
+
+        speak("Yes, I'm listening. How can I help you?");
+        return;
+      }
+
+      // PHASE 2: Session is active — process commands
+      if (sessionActive && finalTranscript && !isProcessing) {
+        const command = finalTranscript.replace(/hey memory/gi, "").trim();
+
+        if (
+          command.length > 2 &&
+          command !== lastProcessedRef.current &&
+          !processingLockRef.current
+        ) {
+          lastProcessedRef.current = command;
+          processingLockRef.current = true;
+          setTimeout(() => {
+            processingLockRef.current = false;
+            lastProcessedRef.current = "";
+          }, 3000);
+
+          setTranscript(command);
+          processCommand(command);
+          // NOTE: Session stays active — no reset! User can keep talking.
+        }
+      } else if (sessionActive && interimTranscript) {
+        setTranscript(interimTranscript.replace(/hey memory/gi, "").trim());
+      }
+    };
+
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+      if (event.error !== "no-speech") {
+        setIsListening(false);
+      }
+    };
+
+    recognition.onend = () => {
+      // Auto-restart if we should still be listening and not speaking
+      if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
+        setTimeout(() => {
+          if (stateRef.current.isListening && !stateRef.current.isSpeaking) {
+            try {
+              recognition.start();
+            } catch (e) {
+              console.error("Failed to restart recognition:", e);
+            }
+          }
+        }, RESTART_DELAY_MS);
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    return () => {
+      try { recognition.stop(); } catch (e) {}
+      if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Created ONCE — all mutable state accessed via stateRef
+
+  // Start session timeout when session becomes active
+  useEffect(() => {
+    if (sessionActive) {
+      resetSessionTimeout();
+    }
+    return () => {
+      if (sessionTimeoutRef.current) clearTimeout(sessionTimeoutRef.current);
+    };
+  }, [sessionActive, resetSessionTimeout]);
+
+  // Start/stop listening
+  const toggleListening = useCallback(() => {
+    if (stateRef.current.isListening) {
+      try { recognitionRef.current?.stop(); } catch (e) {}
+      setIsListening(false);
+      setSessionActive(false);
+      setTranscript("");
+      wakeWordCooldownRef.current = false;
+    } else {
+      try {
+        recognitionRef.current?.start();
+        setIsListening(true);
+        toast.success('Voice assistant activated. Say "Hey Memory" to start!');
+      } catch (e) {
+        console.error("Failed to start recognition:", e);
+        toast.error("Could not start voice recognition");
+      }
+    }
+  }, []);
 
   return (
     <>
@@ -276,11 +339,13 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-primary" />
-                <span className="font-semibold text-foreground">Voice Assistant</span>
+                <span className="font-semibold text-foreground">
+                  Voice Assistant
+                </span>
               </div>
-              <Button 
-                variant="ghost" 
-                size="icon" 
+              <Button
+                variant="ghost"
+                size="icon"
                 className="h-8 w-8"
                 onClick={() => setIsExpanded(false)}
               >
@@ -300,14 +365,16 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
                   <Volume2 className="h-4 w-4 animate-pulse" />
                   <span className="text-sm">{response}</span>
                 </div>
-              ) : wakeWordDetected ? (
+              ) : sessionActive ? (
                 <div className="flex items-center gap-2 text-success">
                   <Mic className="h-4 w-4 animate-pulse" />
-                  <span>{transcript || "Listening..."}</span>
+                  <span>{transcript || "Listening... go ahead!"}</span>
                 </div>
               ) : isListening ? (
                 <div className="text-muted-foreground text-sm">
-                  Say <span className="font-bold text-primary">"Hey Memory"</span> to talk to me
+                  Say{" "}
+                  <span className="font-bold text-primary">"Hey Memory"</span>{" "}
+                  to talk to me
                 </div>
               ) : (
                 <div className="text-muted-foreground text-sm">
@@ -348,7 +415,11 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
                 onClick={() => setAudioEnabled(!audioEnabled)}
                 className="shrink-0"
               >
-                {audioEnabled ? <Volume2 className="h-5 w-5" /> : <VolumeX className="h-5 w-5" />}
+                {audioEnabled ? (
+                  <Volume2 className="h-5 w-5" />
+                ) : (
+                  <VolumeX className="h-5 w-5" />
+                )}
               </Button>
               {isSpeaking && (
                 <Button
@@ -366,10 +437,20 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
             <div className="mt-3 pt-3 border-t border-border">
               <p className="text-xs text-muted-foreground mb-2">Try saying:</p>
               <div className="flex flex-wrap gap-1">
-                {["Show my family", "Who is Maria?", "Play quiz", "What did I do yesterday?"].map((cmd) => (
+                {[
+                  "Show my family",
+                  "Play matching game",
+                  "Play Sudoku",
+                  "What did I do yesterday?",
+                  "Open my medications",
+                  "Open caregiver portal"
+                ].map((cmd) => (
                   <button
                     key={cmd}
-                    onClick={() => processCommand(cmd)}
+                    onClick={() => {
+                      setSessionActive(true);
+                      processCommand(cmd);
+                    }}
                     className="text-xs bg-muted hover:bg-muted/80 px-2 py-1 rounded-full transition-colors"
                   >
                     {cmd}
@@ -392,11 +473,12 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
             relative flex items-center justify-center
             w-16 h-16 rounded-full shadow-elevated
             transition-all duration-300 hover:scale-105
-            ${isListening 
-              ? 'bg-primary animate-pulse' 
-              : 'bg-primary hover:bg-primary/90'
+            ${
+              isListening
+                ? "bg-primary animate-pulse"
+                : "bg-primary hover:bg-primary/90"
             }
-            ${wakeWordDetected ? 'ring-4 ring-success ring-opacity-50' : ''}
+            ${sessionActive ? "ring-4 ring-success ring-opacity-50" : ""}
           `}
           data-testid="voice-assistant-button"
         >
@@ -407,7 +489,7 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
           ) : (
             <Mic className="h-8 w-8 text-primary-foreground" />
           )}
-          
+
           {/* Listening indicator */}
           {isListening && (
             <span className="absolute -top-1 -right-1 flex h-4 w-4">
@@ -420,7 +502,9 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
         {/* Hint text */}
         {!isExpanded && (
           <div className="bg-background/90 backdrop-blur px-3 py-1 rounded-full shadow-soft text-sm">
-            {isListening ? (
+            {sessionActive ? (
+              <span className="text-success font-medium">Listening...</span>
+            ) : isListening ? (
               <span className="text-primary font-medium">Say "Hey Memory"</span>
             ) : (
               <span className="text-muted-foreground">Voice Assistant</span>
