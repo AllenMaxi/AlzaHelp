@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import { useVoiceFallback } from "@/hooks/useVoiceFallback";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const WAKE_WORD = "hey memory";
@@ -27,6 +28,9 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
   const [sessionActive, setSessionActive] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [sessionId] = useState(() => `voice_${Date.now()}`);
+  const [isFallbackMode, setIsFallbackMode] = useState(false);
+
+  const { isNativeAvailable, startRecording, stopAndTranscribe, isRecording } = useVoiceFallback();
 
   const recognitionRef = useRef(null);
   const audioRef = useRef(null);
@@ -48,9 +52,10 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
     stateRef.current = { isListening, isSpeaking, isProcessing, sessionActive, audioEnabled };
   }, [isListening, isSpeaking, isProcessing, sessionActive, audioEnabled]);
 
-  // Stable ref for callbacks that change
+  // Stable refs for callbacks that change
   const onNavigateRef = useRef(onNavigate);
   useEffect(() => { onNavigateRef.current = onNavigate; }, [onNavigate]);
+  const processCommandRef = useRef(null);
 
   // Reset session timeout — keeps session alive for 60s after last interaction
   const resetSessionTimeout = useCallback(() => {
@@ -184,14 +189,13 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
       setTranscript("");
     }
   }, [speak, resetSessionTimeout]);
+  useEffect(() => { processCommandRef.current = processCommand; }, [processCommand]);
 
   // Initialize speech recognition ONCE (no state in deps — all accessed via refs)
   useEffect(() => {
-    if (
-      !("webkitSpeechRecognition" in window) &&
-      !("SpeechRecognition" in window)
-    ) {
-      console.warn("Speech recognition not supported");
+    if (!isNativeAvailable()) {
+      console.log("Native speech recognition unavailable — using MediaRecorder fallback");
+      setIsFallbackMode(true);
       return;
     }
 
@@ -308,25 +312,61 @@ export const VoiceAssistant = ({ onNavigate, userName = "Friend" }) => {
     };
   }, [sessionActive, resetSessionTimeout]);
 
-  // Start/stop listening
-  const toggleListening = useCallback(() => {
-    if (stateRef.current.isListening) {
-      try { recognitionRef.current?.stop(); } catch (e) {}
-      setIsListening(false);
-      setSessionActive(false);
-      setTranscript("");
-      wakeWordCooldownRef.current = false;
+  // Start/stop listening (supports both native and fallback modes)
+  const toggleListening = useCallback(async () => {
+    if (isFallbackMode) {
+      // Fallback: tap-to-record with MediaRecorder + Whisper
+      if (isRecording()) {
+        setTranscript("Transcribing...");
+        setIsProcessing(true);
+        try {
+          const text = await stopAndTranscribe();
+          if (text) {
+            setTranscript(text);
+            setSessionActive(true);
+            processCommandRef.current(text);
+          } else {
+            setTranscript("");
+            setIsProcessing(false);
+            toast.error("Could not understand. Please try again.");
+          }
+        } catch (e) {
+          setTranscript("");
+          setIsProcessing(false);
+          toast.error("Transcription failed");
+        }
+        setIsListening(false);
+      } else {
+        try {
+          await startRecording();
+          setIsListening(true);
+          setSessionActive(true);
+          setTranscript("Listening... Tap again when done.");
+          toast.success("Recording... Tap the mic again when you're done speaking.");
+        } catch (e) {
+          toast.error("Could not access microphone");
+        }
+      }
     } else {
-      try {
-        recognitionRef.current?.start();
-        setIsListening(true);
-        toast.success('Voice assistant activated. Say "Hey Memory" to start!');
-      } catch (e) {
-        console.error("Failed to start recognition:", e);
-        toast.error("Could not start voice recognition");
+      // Native: Web Speech API with wake word
+      if (stateRef.current.isListening) {
+        try { recognitionRef.current?.stop(); } catch (e) {}
+        setIsListening(false);
+        setSessionActive(false);
+        setTranscript("");
+        wakeWordCooldownRef.current = false;
+      } else {
+        try {
+          recognitionRef.current?.start();
+          setIsListening(true);
+          toast.success('Voice assistant activated. Say "Hey Memory" to start!');
+        } catch (e) {
+          console.error("Failed to start recognition:", e);
+          toast.error("Could not start voice recognition");
+        }
       }
     }
-  }, []);
+  }, [isFallbackMode, isRecording, stopAndTranscribe, startRecording]);
 
   return (
     <>

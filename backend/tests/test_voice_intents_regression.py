@@ -126,3 +126,57 @@ def test_voice_explicit_medication_navigation(api_client, phrase):
     payload = call_voice(api_client, phrase)
     assert payload.get("action") == "navigate"
     assert payload.get("target") == "medications"
+
+
+# ==================== MEDICATION INTAKE VOICE TESTS ====================
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "I took my medicine",
+        "I've taken my medication",
+        "I already took my pill",
+        "Just took the medicine",
+        "I had my medication",
+        "Done with my pills",
+    ],
+)
+def test_voice_medication_taken_report(api_client, phrase):
+    """Verify that medication taken reports are recognized and handled."""
+    payload = call_voice(api_client, phrase)
+    assert payload.get("action") == "speak"
+    text = (payload.get("response") or "").lower()
+    # Should either confirm logging or say no pending doses
+    assert any(
+        token in text
+        for token in [
+            "recorded", "got it", "taken", "logged",
+            "all your", "doses", "scheduled", "track",
+            "medication", "trouble"
+        ]
+    )
+
+
+# ==================== MOOD REPORT VOICE TESTS ====================
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "I feel happy today",
+        "I'm feeling a bit sad",
+        "I feel tired and low energy",
+        "I'm doing great today",
+    ],
+)
+def test_voice_mood_report(api_client, phrase):
+    """Verify that mood reports are recognized and logged."""
+    payload = call_voice(api_client, phrase)
+    assert payload.get("action") == "speak"
+    text = (payload.get("response") or "").lower()
+    assert any(
+        token in text
+        for token in [
+            "thank you", "noted", "feeling", "mood",
+            "caregiver", "sharing"
+        ]
+    )

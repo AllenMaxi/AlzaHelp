@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(npx:*)",
-      "Bash(yarn install:*)"
+      "Bash(yarn install:*)",
+      "Bash(python3:*)",
+      "Bash(head:*)"
     ]
   }
 }

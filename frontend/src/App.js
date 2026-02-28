@@ -5,7 +5,11 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { AuthCallback } from "@/components/auth/AuthCallback";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { LoginPage } from "@/pages/LoginPage";
+import { LandingPage } from "@/pages/LandingPage";
 import { DashboardPage } from "@/pages/DashboardPage";
+import { PrivacyPolicyPage } from "@/pages/PrivacyPolicyPage";
+import { TermsOfServicePage } from "@/pages/TermsOfServicePage";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Toaster } from "@/components/ui/sonner";
 
 // AppRouter handles session_id detection BEFORE routing
@@ -30,8 +34,10 @@ const AppRouter = () => {
           </ProtectedRoute>
         } 
       />
-      <Route path="/" element={<Navigate to="/dashboard" replace />} />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="/privacy" element={<PrivacyPolicyPage />} />
+      <Route path="/terms" element={<TermsOfServicePage />} />
+      <Route path="/" element={<LandingPage />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 };
@@ -49,14 +55,16 @@ function App() {
   }, [darkMode]);
 
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <div className="min-h-screen bg-background">
-          <AppRouter />
-          <Toaster position="top-center" richColors />
-        </div>
-      </BrowserRouter>
-    </AuthProvider>
+    <ErrorBoundary level="app">
+      <AuthProvider>
+        <BrowserRouter>
+          <div className="min-h-screen bg-background">
+            <AppRouter />
+            <Toaster position="top-center" richColors />
+          </div>
+        </BrowserRouter>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }
 
