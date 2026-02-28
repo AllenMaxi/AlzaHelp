@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Any, Tuple
+import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta, date
 import httpx
@@ -17,11 +18,40 @@ import io
 import base64
 import math
 import secrets
+import hmac
+import hashlib
 import zipfile
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 from openai import AsyncOpenAI
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    _HAS_SLOWAPI = True
+except ImportError:
+    _HAS_SLOWAPI = False
+
+try:
+    import stripe as stripe_lib
+    _stripe_key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+    if _stripe_key:
+        stripe_lib.api_key = _stripe_key
+        _HAS_STRIPE = True
+    else:
+        _HAS_STRIPE = False
+except ImportError:
+    stripe_lib = None
+    _HAS_STRIPE = False
+
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "").strip()
+
+# Patient limits per subscription tier
+PATIENT_LIMITS = {"free": 3, "premium": 20}
 
 try:
     from pypdf import PdfReader
@@ -33,13 +63,30 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     DocxDocument = None
 
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+    _HAS_REPORTLAB = True
+except ImportError:
+    _HAS_REPORTLAB = False
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # Auth Configuration
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "fallback_secret_key_change_in_production")
+_jwt_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
+if not _jwt_secret:
+    _jwt_secret = secrets.token_hex(32)
+    logging.getLogger(__name__).warning("JWT_SECRET_KEY not set — generated ephemeral key. Tokens will not survive restarts.")
+SECRET_KEY = _jwt_secret
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "lax")
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
 
 # Password hashing configuration
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -62,7 +109,19 @@ db = client[os.environ['DB_NAME']]
 fs_bucket = AsyncIOMotorGridFSBucket(db)
 
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="AlzaHelp API", version="1.0.0")
+
+# Rate limiting
+if _HAS_SLOWAPI:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+def rate_limit(limit_string: str):
+    """Apply rate limit if slowapi is available, otherwise no-op."""
+    if _HAS_SLOWAPI:
+        return limiter.limit(limit_string)
+    return lambda f: f
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -117,6 +176,55 @@ BPSD_SYMPTOM_TAXONOMY = [
 ]
 
 BPSD_TIME_OF_DAY = ["morning", "afternoon", "evening", "night"]
+EXTERNAL_BOT_CHANNELS = {"telegram", "whatsapp"}
+EXTERNAL_BOT_ALLOWED_ROLES = {"caregiver", "clinician", "admin"}
+DOCTOR_BOT_INTENTS = {
+    "progress_summary",
+    "medications_today",
+    "missed_doses",
+    "safety_alerts",
+    "mood_behavior",
+    "today_instructions",
+    "compliance_check",
+    "full_report",
+    "add_medication",
+    "update_medication",
+    "deactivate_medication",
+    "add_care_instruction",
+    "log_patient_intake",
+    "unknown"
+}
+DOCTOR_BOT_WRITE_INTENTS = {
+    "add_medication", "update_medication", "deactivate_medication",
+    "add_care_instruction", "log_patient_intake"
+}
+
+# File upload security
+ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4",
+    "video/mp4", "video/webm",
+    "application/pdf",
+}
+ALLOWED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp",
+    ".mp3", ".wav", ".webm", ".ogg", ".m4a",
+    ".mp4",
+    ".pdf",
+}
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+def validate_upload(file: UploadFile, content: bytes):
+    """Validate file type, extension, and size. Raises HTTPException on failure."""
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024*1024)}MB.")
+    content_type = file.content_type or "application/octet-stream"
+    if content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=415, detail=f"File type '{content_type}' not allowed.")
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if ext and ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail=f"File extension '{ext}' not allowed.")
+    return ext or ".bin"
 
 # ==================== HELPERS ====================
 
@@ -126,6 +234,15 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
+def validate_password_strength(password: str):
+    """Enforce minimum password requirements."""
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
+    if not re.search(r'[A-Z]', password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter.")
+    if not re.search(r'\d', password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number.")
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -133,8 +250,13 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
+    to_encode["iat"] = int(datetime.now(timezone.utc).timestamp())
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+def create_refresh_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    return jwt.encode({"sub_refresh": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 def parse_admin_bootstrap_emails() -> set:
     raw = os.environ.get("ADMIN_BOOTSTRAP_EMAILS", "")
@@ -142,6 +264,91 @@ def parse_admin_bootstrap_emails() -> set:
 
 def is_bootstrap_admin_email(email: str) -> bool:
     return email.strip().lower() in parse_admin_bootstrap_emails()
+
+def normalize_external_bot_channel(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = value.strip().lower()
+    return cleaned if cleaned in EXTERNAL_BOT_CHANNELS else ""
+
+def role_can_use_external_bot(user: "User") -> bool:
+    return (user.role or "").strip().lower() in EXTERNAL_BOT_ALLOWED_ROLES
+
+def create_external_bot_link_code() -> str:
+    # Friendly and short code for messaging apps.
+    return secrets.token_hex(4).upper()
+
+def normalize_external_peer_id(channel: str, raw_peer_id: Optional[str]) -> str:
+    value = (raw_peer_id or "").strip()
+    if channel == "whatsapp":
+        value = value.lower()
+    return value
+
+def verify_twilio_signature(
+    auth_token: str,
+    request_url: str,
+    params: dict,
+    signature: str
+) -> bool:
+    """Validate Twilio webhook signature using X-Twilio-Signature."""
+    if not auth_token:
+        return True
+    if not signature:
+        return False
+    base = request_url
+    for key in sorted(params.keys()):
+        base += f"{key}{params[key]}"
+    digest = hmac.new(auth_token.encode("utf-8"), base.encode("utf-8"), hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+def classify_doctor_bot_intent_heuristic(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return "unknown"
+    # Write intents (check first — higher priority than reads)
+    if any(k in lowered for k in ["add medication", "add medicine", "new medication", "new medicine",
+                                   "prescribe", "new prescription", "create medication", "add pill",
+                                   "add a medication", "add a medicine", "add a pill"]):
+        return "add_medication"
+    if any(k in lowered for k in ["add instruction", "add care instruction", "create instruction",
+                                   "new instruction", "new care plan", "add protocol",
+                                   "upload instruction", "add procedure", "create care plan"]):
+        return "add_care_instruction"
+    if any(k in lowered for k in ["stop medication", "stop medicine", "deactivate medication",
+                                   "discontinue", "cancel medication", "remove medication",
+                                   "stop pill", "deactivate medicine"]):
+        return "deactivate_medication"
+    if any(k in lowered for k in ["update medication", "change medication", "change dosage",
+                                   "update dosage", "modify medication", "adjust medication",
+                                   "change dose", "update dose", "change times",
+                                   "update schedule", "change frequency"]):
+        return "update_medication"
+    if (any(k in lowered for k in ["mark as taken", "mark taken", "log intake", "patient took",
+                                    "mark dose taken", "confirm intake", "record intake",
+                                    "log dose", "she took", "he took", "as taken"])
+            or re.search(r"\bmark\b.*\btaken\b", lowered)):
+        return "log_patient_intake"
+    # Read intents
+    if any(k in lowered for k in ["full report", "complete report", "everything", "all details"]):
+        return "full_report"
+    if any(k in lowered for k in ["missed", "skipped", "not taken", "overdue dose"]):
+        return "missed_doses"
+    if any(k in lowered for k in ["alert", "sos", "fall", "geofence", "safety"]):
+        return "safety_alerts"
+    if any(k in lowered for k in ["mood", "behavior", "agitation", "sleep", "bpsd", "anxiety", "depression"]):
+        return "mood_behavior"
+    if any(k in lowered for k in ["instruction", "procedure", "protocol", "regimen", "care plan", "steps"]) and any(
+        c in lowered for c in ["today", "tonight", "now", "read", "what are", "show"]
+    ):
+        return "today_instructions"
+    if any(k in lowered for k in ["requirement", "compliance", "fulfilled", "all done", "completed all"]):
+        return "compliance_check"
+    if any(k in lowered for k in ["medication", "medicine", "pill", "dose", "dosage", "what to take", "when to take"]):
+        return "medications_today"
+    if any(k in lowered for k in ["progress", "status", "summary", "how is", "report", "update"]):
+        return "progress_summary"
+    return "unknown"
 
 def normalize_hhmm(value: str) -> str:
     """Normalize time values into HH:MM."""
@@ -221,6 +428,27 @@ def is_medication_schedule_question(text: str) -> bool:
     )
     return has_explicit_schedule_phrase or has_today_schedule_phrase
 
+def is_medication_taken_report(text: str) -> bool:
+    """Detect when patient reports they took their medication."""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    # Must not match schedule questions
+    if is_medication_schedule_question(text):
+        return False
+    taken_phrases = [
+        "i took", "i've taken", "i have taken", "already took", "just took",
+        "took my", "finished my medicine", "finished my medication",
+        "done with my pills", "done with my medicine", "done with my medication",
+        "i had my medication", "i had my medicine", "i had my pill",
+        "i took the", "taken my medicine", "taken my medication", "taken my pill",
+        "i swallowed", "medicine taken", "medication taken", "pill taken",
+        "took the pill", "took the medicine", "took the medication",
+        "i already had my", "completed my dose", "had my dose"
+    ]
+    return any(phrase in lowered for phrase in taken_phrases)
+
+
 def is_today_instruction_question(text: str) -> bool:
     lowered = (text or "").strip().lower()
     if not lowered:
@@ -262,6 +490,8 @@ async def classify_special_voice_intent(text: str) -> str:
         "Classify the user's utterance into one intent.\n"
         "Allowed intents:\n"
         "- medication_schedule: asking what/when medicines to take today or now.\n"
+        "- medication_taken: patient reports they took their medicine, a pill, a dose, or confirms intake.\n"
+        "- mood_report: patient describes how they feel, their mood, energy, or emotional state (e.g. 'I feel happy', 'I'm sad', 'feeling tired').\n"
         "- today_instructions: asking for today's care procedures/instructions/regimen.\n"
         "- unsupported_chess: asking to play chess.\n"
         "- none: everything else.\n"
@@ -282,7 +512,7 @@ async def classify_special_voice_intent(text: str) -> str:
         raw = (completion.choices[0].message.content or "").strip()
         parsed = json.loads(raw) if raw else {}
         intent = str(parsed.get("intent", "none")).strip().lower()
-        if intent in {"medication_schedule", "today_instructions", "unsupported_chess", "none"}:
+        if intent in {"medication_schedule", "medication_taken", "mood_report", "today_instructions", "unsupported_chess", "none"}:
             return intent
     except Exception as e:
         logger.warning(f"Special voice intent classification failed: {e}")
@@ -617,6 +847,31 @@ async def get_query_embedding(query: str) -> Optional[List[float]]:
         return None
     return embeddings[0]
 
+def _build_memory_search_text(mem: dict) -> str:
+    people_str = ", ".join(mem.get("people", [])) if mem.get("people") else ""
+    return f"{mem.get('title', '')} {mem.get('date', '')} {mem.get('location', '')} {mem.get('description', '')} {people_str}"
+
+def _build_family_search_text(fam: dict) -> str:
+    return f"{fam.get('name', '')} {fam.get('relationship', '')} {fam.get('relationship_label', '')} {fam.get('notes', '')} {fam.get('category', '')}"
+
+async def _embed_and_store_memory(doc: dict):
+    text = _build_memory_search_text(doc)
+    embeddings = await generate_embeddings([text])
+    if embeddings and embeddings[0]:
+        await db.memories.update_one(
+            {"id": doc["id"], "user_id": doc["user_id"]},
+            {"$set": {"embedding": embeddings[0]}}
+        )
+
+async def _embed_and_store_family(doc: dict):
+    text = _build_family_search_text(doc)
+    embeddings = await generate_embeddings([text])
+    if embeddings and embeddings[0]:
+        await db.family_members.update_one(
+            {"id": doc["id"], "user_id": doc["user_id"]},
+            {"$set": {"embedding": embeddings[0]}}
+        )
+
 async def upsert_instruction_chunks(instruction_doc: dict) -> int:
     """Regenerate chunk documents + embeddings for an instruction."""
     instruction_id = instruction_doc["id"]
@@ -707,6 +962,10 @@ class User(BaseModel):
     hashed_password: Optional[str] = None
     picture: Optional[str] = None
     linked_patient_ids: List[str] = []
+    subscription_tier: str = "free"  # "free" | "premium"
+    stripe_customer_id: Optional[str] = None
+    stripe_subscription_id: Optional[str] = None
+    subscription_expires_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserCreate(BaseModel):
@@ -717,6 +976,7 @@ class UserCreate(BaseModel):
     license_number: Optional[str] = None
     medical_organization: Optional[str] = None
     jurisdiction: Optional[str] = None
+    referral_code: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: str
@@ -746,6 +1006,7 @@ class FamilyMember(BaseModel):
     voice_notes: List[str] = []
     notes: Optional[str] = None
     category: str  # spouse, children, grandchildren, friends, other
+    embedding: Optional[List[float]] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -1150,6 +1411,19 @@ class CareInviteCreate(BaseModel):
 class CareInviteAccept(BaseModel):
     code: str
 
+class ExternalBotLinkCodeCreate(BaseModel):
+    channel: str
+    patient_user_id: Optional[str] = None
+    expires_in_minutes: int = 20
+
+class ExternalBotLinkPatientUpdate(BaseModel):
+    patient_user_id: Optional[str] = None
+
+class DoctorBotQueryRequest(BaseModel):
+    text: str
+    patient_user_id: Optional[str] = None
+    prefer_voice: bool = False
+
 class CaregiverReminderCreate(BaseModel):
     title: str
     time: str
@@ -1190,6 +1464,7 @@ async def get_current_user(request: Request) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
+        token_iat = payload.get("iat")
         if email is None:
             raise HTTPException(status_code=401, detail="Invalid authentication token")
     except JWTError:
@@ -1216,7 +1491,19 @@ async def get_current_user(request: Request) -> User:
             raise HTTPException(status_code=403, detail="Clinician account pending admin approval.")
         if approval_status in {"rejected", "suspended"}:
             raise HTTPException(status_code=403, detail="Clinician account not approved.")
-    
+
+    # Token revocation: reject tokens issued before password change
+    pwd_changed = user_doc.get("password_changed_at")
+    if pwd_changed and token_iat:
+        if isinstance(pwd_changed, str):
+            pwd_changed_ts = datetime.fromisoformat(pwd_changed).timestamp()
+        elif isinstance(pwd_changed, datetime):
+            pwd_changed_ts = pwd_changed.timestamp()
+        else:
+            pwd_changed_ts = 0
+        if token_iat < pwd_changed_ts:
+            raise HTTPException(status_code=401, detail="Session expired. Please login again.")
+
     return User(**user_doc)
 
 def require_admin_user(current_user: User):
@@ -1552,7 +1839,8 @@ async def log_admin_audit(
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register")
-async def register(user_data: UserCreate):
+@rate_limit("5/minute")
+async def register(request: Request, user_data: UserCreate):
     """Register a new user"""
     # Check if user exists
     existing_user = await db.users.find_one({"email": user_data.email})
@@ -1563,6 +1851,7 @@ async def register(user_data: UserCreate):
 
     # Create user
     user_id = f"user_{uuid.uuid4().hex[:12]}"
+    validate_password_strength(user_data.password)
     hashed_password = get_password_hash(user_data.password)
     role = requested_role
     account_status = "active"
@@ -1599,10 +1888,16 @@ async def register(user_data: UserCreate):
         "hashed_password": hashed_password,
         "picture": None,
         "linked_patient_ids": [],
+        "password_changed_at": datetime.now(timezone.utc).isoformat(),
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
-    
+
+    if user_data.referral_code:
+        referrer = await db.users.find_one({"referral_code": user_data.referral_code})
+        if referrer:
+            new_user["referred_by"] = user_data.referral_code
+
     await db.users.insert_one(new_user)
     if requested_role == "clinician":
         return {
@@ -1613,7 +1908,8 @@ async def register(user_data: UserCreate):
     return {"message": "User registered successfully", "user_id": user_id, "requires_approval": False}
 
 @api_router.post("/auth/login")
-async def login(response: Response, form_data: UserLogin):
+@rate_limit("10/minute")
+async def login(request: Request, response: Response, form_data: UserLogin):
     """Login user and set JWT cookie"""
     # Find user
     user_doc = await db.users.find_one({"email": form_data.email})
@@ -1646,17 +1942,27 @@ async def login(response: Response, form_data: UserLogin):
         expires_delta=access_token_expires
     )
     
-    # Set cookie
+    # Set cookies
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=True,
-        samesite="none",
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
         path="/",
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
-    
+    refresh_token = create_refresh_token(user_doc["user_id"])
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        path="/api/auth/refresh",
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+    )
+
     return {"message": "Login successful", "user": User(**user_doc)}
 
 @api_router.get("/auth/me")
@@ -1668,7 +1974,369 @@ async def get_me(current_user: User = Depends(get_current_user)):
 async def logout(response: Response):
     """Logout user"""
     response.delete_cookie(key="access_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/api/auth/refresh")
     return {"message": "Logged out"}
+
+@api_router.delete("/auth/account")
+async def delete_account(current_user: User = Depends(get_current_user)):
+    """Delete user account and all associated data (GDPR right to be forgotten)."""
+    guard_demo_write(current_user)
+    uid = current_user.user_id
+    collections = [
+        "memories", "family_members", "reminders", "medications",
+        "medication_intake_logs", "destinations", "chat_messages",
+        "safety_zones", "safety_alerts", "safety_fall_events",
+        "safety_escalation_events", "safety_escalation_rules",
+        "safety_emergency_contacts", "safety_location_shares",
+        "mood_checkins", "bpsd_observations",
+        "care_instructions", "care_instruction_chunks",
+        "care_links", "care_invites",
+        "push_subscriptions", "external_bot_links",
+        "external_bot_message_logs", "alert_notification_logs",
+        "admin_audit_logs"
+    ]
+    for coll in collections:
+        await db[coll].delete_many({"user_id": uid})
+    await db.users.delete_one({"user_id": uid})
+    return {"message": "Account and all data deleted"}
+
+@api_router.get("/auth/export")
+async def export_account_data(current_user: User = Depends(get_current_user)):
+    """Export all user data as JSON (GDPR data portability)."""
+    uid = current_user.user_id
+    export = {}
+    for coll_name in ["memories", "family_members", "reminders", "medications",
+                       "medication_intake_logs", "chat_messages", "mood_checkins",
+                       "bpsd_observations", "care_instructions", "destinations",
+                       "safety_zones", "safety_emergency_contacts"]:
+        docs = await db[coll_name].find({"user_id": uid}, {"_id": 0, "embedding": 0}).to_list(5000)
+        # Convert datetime objects to strings for JSON serialization
+        for doc in docs:
+            for k, v in doc.items():
+                if isinstance(v, datetime):
+                    doc[k] = v.isoformat()
+        export[coll_name] = docs
+    user_doc = await db.users.find_one({"user_id": uid}, {"_id": 0, "hashed_password": 0})
+    if user_doc:
+        for k, v in user_doc.items():
+            if isinstance(v, datetime):
+                user_doc[k] = v.isoformat()
+    export["profile"] = user_doc
+    return export
+
+@api_router.post("/auth/refresh")
+@rate_limit("20/minute")
+async def refresh_access_token(request: Request, response: Response):
+    """Refresh access token using refresh token cookie"""
+    token = request.cookies.get("refresh_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No refresh token")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub_refresh")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Expired refresh token")
+    user_doc = await db.users.find_one({"user_id": user_id})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+    new_access = create_access_token(
+        data={"sub": user_doc["email"], "user_id": user_id, "role": user_doc.get("role", "patient")},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    response.set_cookie(
+        key="access_token", value=new_access, httponly=True,
+        secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, path="/",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    return {"message": "Token refreshed"}
+
+
+# ==================== DEMO MODE ====================
+
+DEMO_USER_ID = "demo_patient_001"
+DEMO_USER_EMAIL = "demo@alzahelp.app"
+
+async def _seed_demo_account():
+    """Create or refresh the demo account with sample data."""
+    existing = await db.users.find_one({"user_id": DEMO_USER_ID})
+    if existing:
+        return
+
+    await db.users.insert_one({
+        "user_id": DEMO_USER_ID,
+        "email": DEMO_USER_EMAIL,
+        "name": "Maria Garcia",
+        "role": "patient",
+        "account_status": "active",
+        "is_demo": True,
+        "hashed_password": get_password_hash("DemoAccount1!"),
+        "linked_patient_ids": [],
+        "subscription_tier": "premium",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "password_changed_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    family = [
+        {"id": "fam_demo_01", "user_id": DEMO_USER_ID, "name": "Carlos Garcia", "relationship": "Son", "phone": "+1-555-0101", "notes": "Visits every Sunday"},
+        {"id": "fam_demo_02", "user_id": DEMO_USER_ID, "name": "Sofia Garcia", "relationship": "Daughter", "phone": "+1-555-0102", "notes": "Lives nearby, helps with groceries"},
+        {"id": "fam_demo_03", "user_id": DEMO_USER_ID, "name": "Pedro Garcia", "relationship": "Husband", "phone": "+1-555-0100", "notes": "Primary caregiver"},
+    ]
+    for fm in family:
+        fm["created_at"] = datetime.now(timezone.utc).isoformat()
+        await db.family_members.insert_one(fm)
+
+    meds = [
+        {"id": "med_demo_01", "user_id": DEMO_USER_ID, "name": "Donepezil", "dosage": "10mg", "frequency": "daily", "scheduled_times": ["08:00"], "active": True, "notes": "Take with breakfast"},
+        {"id": "med_demo_02", "user_id": DEMO_USER_ID, "name": "Memantine", "dosage": "20mg", "frequency": "daily", "scheduled_times": ["09:00"], "active": True, "notes": "For cognitive symptoms"},
+        {"id": "med_demo_03", "user_id": DEMO_USER_ID, "name": "Vitamin D", "dosage": "2000 IU", "frequency": "daily", "scheduled_times": ["08:00"], "active": True, "notes": "With food"},
+        {"id": "med_demo_04", "user_id": DEMO_USER_ID, "name": "Melatonin", "dosage": "3mg", "frequency": "daily", "scheduled_times": ["21:00"], "active": True, "notes": "Before bed for sleep"},
+    ]
+    for med in meds:
+        med["created_at"] = datetime.now(timezone.utc).isoformat()
+        await db.medications.insert_one(med)
+
+    memories = [
+        {"id": "mem_demo_01", "user_id": DEMO_USER_ID, "title": "Wedding Day", "date": "1985-06-15", "year": 1985, "location": "Santiago, Chile", "description": "Pedro and I got married at the beautiful church on Avenida Providencia. Sofia was the flower girl and Carlos carried the rings.", "people": ["Pedro Garcia", "Sofia Garcia", "Carlos Garcia"], "photos": [], "category": "milestone"},
+        {"id": "mem_demo_02", "user_id": DEMO_USER_ID, "title": "Carlos's Graduation", "date": "2010-12-20", "year": 2010, "location": "University of Chile", "description": "Carlos graduated with honors in engineering. The whole family was there. We celebrated at that restaurant by the park.", "people": ["Carlos Garcia", "Pedro Garcia"], "photos": [], "category": "milestone"},
+        {"id": "mem_demo_03", "user_id": DEMO_USER_ID, "title": "Summer at the Beach", "date": "2019-01-10", "year": 2019, "location": "Viña del Mar", "description": "We spent two weeks at the coast. The grandchildren loved building sandcastles. Sofia made her famous empanadas.", "people": ["Sofia Garcia", "Pedro Garcia"], "photos": [], "category": "vacation"},
+        {"id": "mem_demo_04", "user_id": DEMO_USER_ID, "title": "Morning Walk Routine", "date": "2025-11-01", "year": 2025, "location": "Neighborhood Park", "description": "Pedro and I walk every morning around the park. We feed the pigeons near the fountain. It helps me feel calm.", "people": ["Pedro Garcia"], "photos": [], "category": "routine"},
+        {"id": "mem_demo_05", "user_id": DEMO_USER_ID, "title": "Cooking with Sofia", "date": "2025-12-25", "year": 2025, "location": "Home", "description": "Sofia came over for Christmas and we made pastel de choclo together. She said it tasted just like abuela's recipe.", "people": ["Sofia Garcia"], "photos": [], "category": "family"},
+    ]
+    for mem in memories:
+        mem["created_at"] = datetime.now(timezone.utc).isoformat()
+        mem["updated_at"] = datetime.now(timezone.utc).isoformat()
+        mem["search_text"] = f"{mem['title']} {mem['date']} {mem.get('location', '')} {mem['description']} {', '.join(mem['people'])}".lower()
+        await db.memories.insert_one(mem)
+
+    for i in range(7):
+        day = datetime.now(timezone.utc) - timedelta(days=i)
+        await db.mood_checkins.insert_one({
+            "id": f"mood_demo_{i:02d}",
+            "user_id": DEMO_USER_ID,
+            "mood_score": [3, 2, 3, 2, 3, 2, 3][i],
+            "energy_level": [2, 2, 3, 1, 2, 3, 2][i],
+            "anxiety_level": [1, 2, 1, 2, 1, 1, 2][i],
+            "sleep_quality": [3, 2, 3, 2, 2, 3, 3][i],
+            "appetite": [2, 3, 2, 2, 3, 2, 3][i],
+            "notes": ["Good day", "Felt a bit confused", "Enjoyed the walk", "Tired", "Happy to see Carlos", "Quiet day", "Slept well"][i],
+            "source": "patient",
+            "created_at": day.isoformat(),
+        })
+
+    reminders = [
+        {"id": "rem_demo_01", "user_id": DEMO_USER_ID, "title": "Morning walk with Pedro", "time": "09:00", "active": True},
+        {"id": "rem_demo_02", "user_id": DEMO_USER_ID, "title": "Call Sofia", "time": "15:00", "active": True},
+        {"id": "rem_demo_03", "user_id": DEMO_USER_ID, "title": "Water the plants", "time": "10:00", "active": True},
+    ]
+    for rem in reminders:
+        rem["created_at"] = datetime.now(timezone.utc).isoformat()
+        await db.reminders.insert_one(rem)
+
+
+def is_demo_user(current_user) -> bool:
+    """Check if the current user is the demo account."""
+    uid = getattr(current_user, 'user_id', '') if not isinstance(current_user, dict) else current_user.get('user_id', '')
+    return uid == DEMO_USER_ID
+
+
+def guard_demo_write(current_user):
+    """Block write operations for demo users."""
+    if is_demo_user(current_user):
+        raise HTTPException(status_code=403, detail="Demo mode is read-only. Sign up to save your own data!")
+
+
+@api_router.post("/auth/demo")
+@rate_limit("20/minute")
+async def start_demo(request: Request, response: Response):
+    """Start a demo session with pre-populated data."""
+    await _seed_demo_account()
+    access_token_expires = timedelta(hours=2)
+    access_token = create_access_token(
+        data={"sub": DEMO_USER_EMAIL, "user_id": DEMO_USER_ID, "role": "patient"},
+        expires_delta=access_token_expires
+    )
+    response.set_cookie(
+        key="access_token", value=access_token, httponly=True,
+        secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, path="/",
+        max_age=2 * 60 * 60
+    )
+    return {"message": "Demo started", "user": {"user_id": DEMO_USER_ID, "name": "Maria Garcia", "role": "patient", "is_demo": True}}
+
+
+# ==================== BILLING / SUBSCRIPTIONS ====================
+
+def require_premium(user):
+    """Raise 403 if user is not on the premium tier (or within grace period)."""
+    doc = user if isinstance(user, dict) else user.dict()
+    tier = doc.get("subscription_tier", "free")
+    if tier == "premium":
+        return
+    expires = doc.get("subscription_expires_at")
+    if expires and expires > datetime.now(timezone.utc):
+        return  # still in grace period
+    raise HTTPException(
+        status_code=403,
+        detail="This feature requires AlzaHelp Premium. Upgrade at your dashboard.",
+    )
+
+
+def _is_premium(user) -> bool:
+    """Check if user has premium without raising."""
+    doc = user if isinstance(user, dict) else user.dict()
+    if doc.get("subscription_tier") == "premium":
+        return True
+    expires = doc.get("subscription_expires_at")
+    return bool(expires and expires > datetime.now(timezone.utc))
+
+
+@api_router.get("/billing/status")
+async def billing_status(current_user: User = Depends(get_current_user)):
+    """Return current subscription status."""
+    user_doc = await db.users.find_one({"user_id": current_user.user_id}, {"_id": 0})
+    expires = user_doc.get("subscription_expires_at")
+    tier = user_doc.get("subscription_tier", "free")
+    patient_limit = PATIENT_LIMITS.get(tier, 3)
+    patient_count = await db.care_links.count_documents(
+        {"caregiver_id": current_user.user_id, "status": "accepted"}
+    )
+    return {
+        "tier": tier,
+        "expires_at": expires.isoformat() if isinstance(expires, datetime) else expires,
+        "has_stripe": _HAS_STRIPE,
+        "patient_limit": patient_limit,
+        "patient_count": patient_count,
+    }
+
+
+@api_router.post("/billing/create-checkout")
+async def billing_create_checkout(current_user: User = Depends(get_current_user)):
+    """Create a Stripe Checkout session for Premium subscription."""
+    if not _HAS_STRIPE:
+        raise HTTPException(status_code=503, detail="Payments not configured")
+    if not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=503, detail="Stripe price not configured")
+
+    frontend_url = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")[0].strip()
+
+    # Find or create Stripe customer
+    user_doc = await db.users.find_one({"user_id": current_user.user_id})
+    stripe_cid = user_doc.get("stripe_customer_id")
+
+    if not stripe_cid:
+        customer = stripe_lib.Customer.create(
+            email=current_user.email,
+            metadata={"user_id": current_user.user_id},
+        )
+        stripe_cid = customer.id
+        await db.users.update_one(
+            {"user_id": current_user.user_id},
+            {"$set": {"stripe_customer_id": stripe_cid}},
+        )
+
+    session = stripe_lib.checkout.Session.create(
+        customer=stripe_cid,
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=f"{frontend_url}/dashboard?billing=success",
+        cancel_url=f"{frontend_url}/dashboard?billing=cancel",
+    )
+    return {"url": session.url}
+
+
+@api_router.post("/billing/create-portal")
+async def billing_create_portal(current_user: User = Depends(get_current_user)):
+    """Create a Stripe Customer Portal session for managing subscription."""
+    if not _HAS_STRIPE:
+        raise HTTPException(status_code=503, detail="Payments not configured")
+
+    user_doc = await db.users.find_one({"user_id": current_user.user_id})
+    stripe_cid = user_doc.get("stripe_customer_id")
+    if not stripe_cid:
+        raise HTTPException(status_code=400, detail="No billing account found")
+
+    frontend_url = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")[0].strip()
+    session = stripe_lib.billing_portal.Session.create(
+        customer=stripe_cid,
+        return_url=f"{frontend_url}/dashboard",
+    )
+    return {"url": session.url}
+
+
+@api_router.post("/billing/webhook")
+async def billing_webhook(request: Request):
+    """Handle Stripe webhook events."""
+    if not _HAS_STRIPE or not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhooks not configured")
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
+    try:
+        event = stripe_lib.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe_lib.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    event_type = event["type"]
+    data_obj = event["data"]["object"]
+    logger = logging.getLogger(__name__)
+
+    if event_type == "checkout.session.completed":
+        customer_id = data_obj.get("customer")
+        subscription_id = data_obj.get("subscription")
+        if customer_id:
+            await db.users.update_one(
+                {"stripe_customer_id": customer_id},
+                {"$set": {
+                    "subscription_tier": "premium",
+                    "stripe_subscription_id": subscription_id,
+                }},
+            )
+            logger.info("User upgraded to premium via checkout: customer=%s", customer_id)
+
+    elif event_type == "customer.subscription.updated":
+        customer_id = data_obj.get("customer")
+        period_end = data_obj.get("current_period_end")
+        if customer_id and period_end:
+            await db.users.update_one(
+                {"stripe_customer_id": customer_id},
+                {"$set": {
+                    "subscription_expires_at": datetime.fromtimestamp(period_end, tz=timezone.utc),
+                }},
+            )
+
+    elif event_type == "customer.subscription.deleted":
+        customer_id = data_obj.get("customer")
+        if customer_id:
+            grace = datetime.now(timezone.utc) + timedelta(days=3)
+            await db.users.update_one(
+                {"stripe_customer_id": customer_id},
+                {"$set": {
+                    "subscription_tier": "free",
+                    "stripe_subscription_id": None,
+                    "subscription_expires_at": grace,
+                }},
+            )
+            logger.info("Subscription cancelled for customer=%s, grace until %s", customer_id, grace.isoformat())
+
+    elif event_type == "invoice.payment_failed":
+        customer_id = data_obj.get("customer")
+        if customer_id:
+            user_doc = await db.users.find_one({"stripe_customer_id": customer_id})
+            if user_doc:
+                try:
+                    await send_push_to_user(
+                        user_doc["user_id"],
+                        "Payment Failed",
+                        "Your AlzaHelp Premium payment failed. Please update your payment method.",
+                        "/dashboard?billing=failed",
+                    )
+                except Exception:
+                    pass
+
+    return {"received": True}
+
 
 # ==================== ADMIN (CLINICIAN GOVERNANCE) ====================
 
@@ -1831,6 +2499,7 @@ async def upload_file(
     current_user: User = Depends(get_current_user)
 ):
     """Upload a file (photo or voice note) to MongoDB GridFS"""
+    guard_demo_write(current_user)
     owner_user_id = await resolve_target_user_id(
         current_user,
         target_user_id,
@@ -1839,14 +2508,10 @@ async def upload_file(
 
     # Read file content
     content = await file.read()
-    
-    # Generate unique filename
-    ext = Path(file.filename).suffix if file.filename else ".jpg"
+    ext = validate_upload(file, content)
     filename = f"{owner_user_id}_{uuid.uuid4().hex[:8]}{ext}"
-    
-    # Determine content type
     content_type = file.content_type or 'application/octet-stream'
-    
+
     # Store in GridFS
     file_id = await fs_bucket.upload_from_stream(
         filename,
@@ -1854,7 +2519,7 @@ async def upload_file(
         metadata={
             "user_id": owner_user_id,
             "content_type": content_type,
-            "original_filename": file.filename,
+            "original_filename": Path(file.filename).name if file.filename else filename,
             "uploaded_at": datetime.now(timezone.utc).isoformat()
         }
     )
@@ -1869,6 +2534,7 @@ async def upload_multiple_files(
     current_user: User = Depends(get_current_user)
 ):
     """Upload multiple files to MongoDB GridFS"""
+    guard_demo_write(current_user)
     owner_user_id = await resolve_target_user_id(
         current_user,
         target_user_id,
@@ -1878,17 +2544,17 @@ async def upload_multiple_files(
     urls = []
     for file in files:
         content = await file.read()
-        ext = Path(file.filename).suffix if file.filename else ".jpg"
+        ext = validate_upload(file, content)
         filename = f"{owner_user_id}_{uuid.uuid4().hex[:8]}{ext}"
         content_type = file.content_type or 'application/octet-stream'
-        
+
         await fs_bucket.upload_from_stream(
             filename,
             io.BytesIO(content),
             metadata={
                 "user_id": owner_user_id,
                 "content_type": content_type,
-                "original_filename": file.filename,
+                "original_filename": Path(file.filename).name if file.filename else filename,
                 "uploaded_at": datetime.now(timezone.utc).isoformat()
             }
         )
@@ -1898,26 +2564,39 @@ async def upload_multiple_files(
     return {"urls": urls}
 
 @api_router.get("/files/{filename}")
-async def get_file(filename: str):
-    """Retrieve a file from MongoDB GridFS"""
+async def get_file(filename: str, request: Request):
+    """Retrieve a file from MongoDB GridFS with ownership verification"""
     try:
-        # Find file in GridFS
         grid_out = await fs_bucket.open_download_stream_by_name(filename)
-        
-        # Read content
         content = await grid_out.read()
-        
-        # Get content type from metadata
-        content_type = grid_out.metadata.get('content_type', 'application/octet-stream') if grid_out.metadata else 'application/octet-stream'
-        
+        metadata = grid_out.metadata or {}
+        content_type = metadata.get('content_type', 'application/octet-stream')
+        file_owner = metadata.get('user_id', '')
+
+        # Demo account files are public
+        is_demo_file = file_owner.startswith("demo_")
+
+        if not is_demo_file:
+            current_user = await get_current_user(request)
+            if current_user.user_id != file_owner and current_user.role != "admin":
+                link = await db.care_links.find_one({
+                    "patient_id": file_owner,
+                    "caregiver_id": current_user.user_id,
+                    "status": "accepted"
+                })
+                if not link:
+                    raise HTTPException(status_code=403, detail="Access denied")
+
         return StreamingResponse(
             io.BytesIO(content),
             media_type=content_type,
             headers={
                 "Content-Disposition": f"inline; filename={filename}",
-                "Cache-Control": "public, max-age=31536000"  # Cache for 1 year
+                "Cache-Control": "private, max-age=3600"
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error retrieving file {filename}: {e}")
         raise HTTPException(status_code=404, detail="File not found")
@@ -1939,6 +2618,7 @@ async def create_family_member(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new family member"""
+    guard_demo_write(current_user)
     member_obj = FamilyMember(
         user_id=current_user.user_id,
         **member.model_dump()
@@ -1952,7 +2632,8 @@ async def create_family_member(
     doc['search_text'] = f"{member.name} {member.relationship} {member.relationship_label} {member.notes or ''}".lower()
     
     await db.family_members.insert_one(doc)
-    
+    asyncio.create_task(_embed_and_store_family(doc))
+
     # Return without search_text and _id
     if 'search_text' in doc:
         del doc['search_text']
@@ -1967,6 +2648,7 @@ async def update_family_member(
     current_user: User = Depends(get_current_user)
 ):
     """Update a family member"""
+    guard_demo_write(current_user)
     update_data = {k: v for k, v in member.model_dump().items() if v is not None}
     update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
     
@@ -1990,11 +2672,13 @@ async def update_family_member(
     
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Family member not found")
-    
+
     updated = await db.family_members.find_one(
         {"id": member_id},
         {"_id": 0, "search_text": 0}
     )
+    if updated:
+        asyncio.create_task(_embed_and_store_family(updated))
     return updated
 
 @api_router.delete("/family/{member_id}")
@@ -2003,6 +2687,7 @@ async def delete_family_member(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a family member"""
+    guard_demo_write(current_user)
     result = await db.family_members.delete_one(
         {"id": member_id, "user_id": current_user.user_id}
     )
@@ -2029,6 +2714,7 @@ async def create_memory(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new memory"""
+    guard_demo_write(current_user)
     memory_obj = Memory(
         user_id=current_user.user_id,
         **memory.model_dump()
@@ -2043,7 +2729,8 @@ async def create_memory(
     doc['search_text'] = f"{memory.title} {memory.date} {memory.location or ''} {memory.description} {people_str}".lower()
     
     await db.memories.insert_one(doc)
-    
+    asyncio.create_task(_embed_and_store_memory(doc))
+
     # Return without search_text and _id
     if 'search_text' in doc:
         del doc['search_text']
@@ -2058,6 +2745,7 @@ async def update_memory(
     current_user: User = Depends(get_current_user)
 ):
     """Update a memory"""
+    guard_demo_write(current_user)
     update_data = {k: v for k, v in memory.model_dump().items() if v is not None}
     update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
     
@@ -2082,11 +2770,13 @@ async def update_memory(
     
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Memory not found")
-    
+
     updated = await db.memories.find_one(
         {"id": memory_id},
         {"_id": 0, "search_text": 0}
     )
+    if updated:
+        asyncio.create_task(_embed_and_store_memory(updated))
     return updated
 
 @api_router.delete("/memories/{memory_id}")
@@ -2095,6 +2785,7 @@ async def delete_memory(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a memory"""
+    guard_demo_write(current_user)
     result = await db.memories.delete_one(
         {"id": memory_id, "user_id": current_user.user_id}
     )
@@ -2121,6 +2812,7 @@ async def create_reminder(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new reminder"""
+    guard_demo_write(current_user)
     reminder_obj = Reminder(
         user_id=current_user.user_id,
         **reminder.model_dump()
@@ -2165,6 +2857,7 @@ async def delete_reminder(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a reminder"""
+    guard_demo_write(current_user)
     result = await db.reminders.delete_one(
         {"id": reminder_id, "user_id": current_user.user_id}
     )
@@ -3099,6 +3792,220 @@ async def build_today_medication_voice_response(owner_id: str) -> str:
         next_line = "All scheduled doses for today are already logged."
     return f"{intro} {detail} {next_line}"
 
+
+async def handle_voice_medication_intake(owner_id: str, spoken_text: str) -> dict:
+    """
+    Handle a patient reporting they took their medication via voice.
+    Returns dict with action and response for the voice assistant.
+    """
+    now_utc = datetime.now(timezone.utc)
+    day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    mar = await _build_medication_mar_for_period(owner_id, day_start, day_end)
+    slots = mar.get("slots", [])
+    medications = mar.get("medications", [])
+
+    # Find pending doses (due, overdue, or upcoming within 2 hours)
+    pending = []
+    for slot in slots:
+        if slot.get("status") in {"due", "overdue", "upcoming"}:
+            sched_str = slot.get("scheduled_for")
+            if sched_str and slot.get("status") == "upcoming":
+                try:
+                    sched_dt = datetime.fromisoformat(sched_str.replace("Z", "+00:00"))
+                    if sched_dt.tzinfo is None:
+                        sched_dt = sched_dt.replace(tzinfo=timezone.utc)
+                    if (sched_dt - now_utc).total_seconds() > 7200:  # >2h in future
+                        continue
+                except Exception:
+                    continue
+            pending.append(slot)
+
+    if not pending:
+        return {
+            "action": "speak",
+            "response": "It looks like all your scheduled doses for today are already taken. Great job staying on track!"
+        }
+
+    # Try to match a specific medication name from the spoken text
+    lowered = (spoken_text or "").lower()
+    matched_slot = None
+
+    # Build a name lookup from medications
+    med_names = {}
+    for med in medications:
+        med_names[med.get("id", "")] = (med.get("name", ""), med.get("dosage", ""))
+
+    for slot in pending:
+        med_id = slot.get("medication_id", "")
+        name, dosage = med_names.get(med_id, ("", ""))
+        name_lower = name.lower()
+        # Check if medication name appears in spoken text
+        if name_lower and name_lower in lowered:
+            matched_slot = slot
+            break
+        # Also check individual words of the name (e.g., "metformin" from "Metformin 500mg")
+        for word in name_lower.split():
+            if len(word) > 3 and word in lowered:
+                matched_slot = slot
+                break
+        if matched_slot:
+            break
+
+    # If exactly 1 pending dose or we matched one, log it
+    target_slot = matched_slot or (pending[0] if len(pending) == 1 else None)
+
+    if not target_slot and len(pending) > 1:
+        # Ask patient which medication
+        names = []
+        for slot in pending[:5]:
+            med_id = slot.get("medication_id", "")
+            name, dosage = med_names.get(med_id, ("medication", ""))
+            label = f"{name} {dosage}".strip() if dosage else name
+            names.append(label)
+        listing = join_voice_items(names)
+        return {
+            "action": "speak",
+            "response": f"I see you have {len(pending)} doses pending: {listing}. Which one did you take?"
+        }
+
+    # Log the intake
+    med_id = target_slot["medication_id"]
+    name, dosage = med_names.get(med_id, ("your medication", ""))
+    label = f"{name} {dosage}".strip() if dosage else name
+
+    scheduled_for = None
+    if target_slot.get("scheduled_for"):
+        try:
+            scheduled_for = datetime.fromisoformat(
+                target_slot["scheduled_for"].replace("Z", "+00:00")
+            )
+            if scheduled_for.tzinfo is None:
+                scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+            scheduled_for = scheduled_for.astimezone(timezone.utc)
+        except Exception:
+            scheduled_for = None
+
+    delay_minutes = None
+    if scheduled_for:
+        delay_minutes = int(round((now_utc - scheduled_for).total_seconds() / 60))
+
+    log_obj = MedicationIntakeLog(
+        user_id=owner_id,
+        medication_id=med_id,
+        status="taken",
+        scheduled_for=scheduled_for,
+        source="voice",
+        notes="Logged via voice assistant",
+        recorded_by_user_id=owner_id,
+        delay_minutes=delay_minutes,
+        confirmed_at=now_utc
+    )
+    doc = log_obj.model_dump()
+    doc["confirmed_at"] = doc["confirmed_at"].isoformat()
+    if doc.get("scheduled_for"):
+        doc["scheduled_for"] = doc["scheduled_for"].isoformat()
+    await db.medication_intake_logs.insert_one(doc)
+
+    # Resolve missed-dose alerts
+    if doc.get("scheduled_for"):
+        await db.medication_missed_alerts.delete_many({
+            "user_id": owner_id,
+            "medication_id": med_id,
+            "scheduled_for": doc["scheduled_for"]
+        })
+        await db.safety_alerts.update_many(
+            {
+                "user_id": owner_id,
+                "event_type": "missed_medication_dose",
+                "acknowledged": False,
+                "medication_id": med_id,
+                "scheduled_for": doc["scheduled_for"]
+            },
+            {
+                "$set": {
+                    "acknowledged": True,
+                    "acknowledged_at": now_utc.isoformat(),
+                    "acknowledged_by_user_id": owner_id,
+                    "escalation_status": "resolved_after_intake",
+                    "escalation_next_at": None
+                }
+            }
+        )
+
+    remaining = len(pending) - 1
+    if remaining > 0:
+        return {
+            "action": "speak",
+            "response": f"Got it! I've recorded that you took {label}. You still have {remaining} more dose{'s' if remaining > 1 else ''} scheduled for today."
+        }
+    return {
+        "action": "speak",
+        "response": f"Got it! I've recorded that you took {label}. That's all your medication for now. Well done!"
+    }
+
+
+async def handle_voice_mood_report(owner_id: str, spoken_text: str) -> dict:
+    """
+    Handle a patient reporting their mood via voice.
+    Uses LLM to extract mood score, then creates a MoodCheckin.
+    """
+    # Use LLM to extract mood information
+    mood_score = 3
+    energy_score = 3
+    notes = spoken_text
+
+    if os.environ.get("OPENAI_API_KEY"):
+        prompt = (
+            "Extract mood information from the patient's statement.\n"
+            "Return strict JSON: {\"mood_score\": <1-5>, \"energy_score\": <1-5>, \"summary\": \"<brief note>\"}\n"
+            "Scale: 1=very bad/low, 2=bad/low, 3=neutral/okay, 4=good/high, 5=very good/high.\n"
+            "If energy is not mentioned, default to 3.\n"
+        )
+        try:
+            client = get_openai_client()
+            completion = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=60,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": spoken_text}
+                ]
+            )
+            raw = (completion.choices[0].message.content or "").strip()
+            parsed = json.loads(raw) if raw else {}
+            mood_score = max(1, min(5, int(parsed.get("mood_score", 3))))
+            energy_score = max(1, min(5, int(parsed.get("energy_score", 3))))
+            notes = parsed.get("summary", spoken_text)
+        except Exception as e:
+            logger.warning(f"Voice mood extraction failed: {e}")
+
+    now_utc = datetime.now(timezone.utc)
+    checkin = MoodCheckin(
+        user_id=owner_id,
+        mood_score=mood_score,
+        energy_score=energy_score,
+        notes=notes,
+        source="voice",
+        created_by_user_id=owner_id,
+        created_at=now_utc
+    )
+    doc = checkin.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    await db.mood_checkins.insert_one(doc)
+
+    mood_labels = {1: "very low", 2: "a bit down", 3: "okay", 4: "good", 5: "great"}
+    mood_word = mood_labels.get(mood_score, "noted")
+
+    return {
+        "action": "speak",
+        "response": f"Thank you for sharing how you feel. I've noted that you're feeling {mood_word}. Your caregiver will be able to see this update."
+    }
+
+
 def instruction_is_due_today(instruction: dict, target_date: date) -> bool:
     frequency = normalize_frequency(instruction.get("frequency"), fallback="daily")
     if frequency == "daily":
@@ -3218,6 +4125,1204 @@ async def build_patient_today_plan(owner_id: str, target_day: Optional[date] = N
         "voice_script": voice_script
     }
 
+# ==================== EXTERNAL DOCTOR BOT ====================
+
+def extract_patient_id_from_text(text: str) -> Optional[str]:
+    match = re.search(r"\buser_[a-z0-9]{12}\b", (text or "").lower())
+    return match.group(0) if match else None
+
+async def get_doctor_accessible_patients(current_user: User, limit: int = 100) -> List[dict]:
+    safe_limit = max(1, min(limit, 200))
+    if current_user.role == "admin":
+        docs = await db.users.find(
+            {"role": "patient", "account_status": "active"},
+            {"_id": 0, "user_id": 1, "name": 1, "email": 1}
+        ).sort("created_at", -1).to_list(safe_limit)
+        return docs
+    if current_user.role == "patient":
+        return [{"user_id": current_user.user_id, "name": current_user.name, "email": current_user.email}]
+
+    links = await db.care_links.find(
+        {"caregiver_id": current_user.user_id, "status": "accepted"},
+        {"_id": 0, "patient_id": 1}
+    ).to_list(500)
+    patient_ids = [l.get("patient_id") for l in links if l.get("patient_id")]
+    if not patient_ids:
+        return []
+    docs = await db.users.find(
+        {"user_id": {"$in": patient_ids}},
+        {"_id": 0, "user_id": 1, "name": 1, "email": 1}
+    ).to_list(min(safe_limit, len(patient_ids)))
+    docs.sort(key=lambda d: (d.get("name") or "").lower())
+    return docs
+
+async def classify_doctor_bot_intent_model(text: str) -> str:
+    if not os.environ.get("OPENAI_API_KEY"):
+        return "unknown"
+    prompt = (
+        "Classify a doctor's message about patient monitoring or management.\n"
+        "Allowed intents:\n"
+        "- progress_summary: asking for overall status/progress\n"
+        "- medications_today: asking about today's medication schedule\n"
+        "- missed_doses: asking about missed or skipped doses\n"
+        "- safety_alerts: asking about safety alerts, falls, geofence\n"
+        "- mood_behavior: asking about mood, behavior, BPSD\n"
+        "- today_instructions: asking about today's care instructions\n"
+        "- compliance_check: asking about compliance/fulfillment\n"
+        "- full_report: requesting a complete report\n"
+        "- add_medication: doctor wants to ADD/CREATE/PRESCRIBE a new medication\n"
+        "- add_care_instruction: doctor wants to ADD/CREATE a care instruction or protocol\n"
+        "- deactivate_medication: doctor wants to STOP/DEACTIVATE/DISCONTINUE a medication\n"
+        "- log_patient_intake: doctor wants to MARK/LOG a dose as taken for the patient\n"
+        "- unknown: does not match any above\n"
+        "Return strict JSON only: {\"intent\":\"...\"}."
+    )
+    try:
+        client = get_openai_client()
+        completion = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=40,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ]
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        parsed = json.loads(raw) if raw else {}
+        intent = str(parsed.get("intent", "unknown")).strip().lower()
+        if intent in DOCTOR_BOT_INTENTS:
+            return intent
+    except Exception as exc:
+        logger.warning(f"Doctor bot intent classification failed: {exc}")
+    return "unknown"
+
+def _format_slot_line(slot: dict) -> str:
+    dt = parse_iso_to_utc(slot.get("scheduled_for"))
+    when = format_datetime_for_voice(dt) if dt else "unknown time"
+    status = str(slot.get("status") or "upcoming").replace("_", " ")
+    return f"- {slot.get('name', 'Medication')} {slot.get('dosage', '')} at {when} ({status})".replace("  ", " ").strip()
+
+def _format_safety_alert_line(alert: dict) -> str:
+    dt = parse_iso_to_utc(alert.get("triggered_at"))
+    when = dt.isoformat() if dt else (alert.get("triggered_at") or "unknown time")
+    sev = normalize_severity(alert.get("severity"), "high")
+    event_type = alert.get("event_type", "alert")
+    message = alert.get("message", "")
+    return f"- [{sev}] {event_type} at {when}: {message}".strip()
+
+async def build_doctor_patient_snapshot(patient_user_id: str, current_user: User) -> dict:
+    owner_id = await resolve_target_user_id(current_user, patient_user_id)
+    patient = await db.users.find_one(
+        {"user_id": owner_id},
+        {"_id": 0, "hashed_password": 0}
+    )
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    reminders = await db.reminders.find({"user_id": owner_id}, {"_id": 0}).to_list(600)
+    completed_reminders = len([r for r in reminders if r.get("completed")])
+    reminder_completion = round((completed_reminders / len(reminders)) * 100, 1) if reminders else 0.0
+
+    adherence = await medication_adherence_summary(7, owner_id, current_user)
+    missed = await medication_missed_doses(2, owner_id, current_user)
+    open_alerts = await db.safety_alerts.find(
+        {"user_id": owner_id, "acknowledged": False},
+        {"_id": 0}
+    ).sort("triggered_at", -1).to_list(50)
+    today_plan = await build_patient_today_plan(owner_id)
+    bpsd_analytics = await compute_bpsd_analytics(owner_id, 30)
+
+    return {
+        "patient": {
+            "user_id": patient.get("user_id"),
+            "name": patient.get("name"),
+            "email": patient.get("email")
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reminders": {
+            "total": len(reminders),
+            "completed": completed_reminders,
+            "completion_percent": reminder_completion
+        },
+        "adherence_7d": adherence,
+        "missed_doses": missed,
+        "open_safety_alerts": open_alerts,
+        "today_plan": today_plan,
+        "bpsd_analytics_30d": bpsd_analytics
+    }
+
+def compose_doctor_bot_response(intent: str, snapshot: dict, question: str) -> str:
+    patient = snapshot.get("patient", {})
+    patient_name = patient.get("name") or patient.get("user_id") or "patient"
+    adherence = snapshot.get("adherence_7d", {})
+    today_plan = snapshot.get("today_plan", {})
+    mar_summary = (today_plan.get("medication_plan") or {}).get("summary", {})
+    slots = (today_plan.get("medication_plan") or {}).get("slots", [])
+    due_instructions = ((today_plan.get("instructions") or {}).get("due_today") or [])
+    as_needed_instructions = ((today_plan.get("instructions") or {}).get("as_needed") or [])
+    open_alerts = snapshot.get("open_safety_alerts", [])
+    missed = snapshot.get("missed_doses", [])
+    bpsd = snapshot.get("bpsd_analytics_30d", {})
+    ts = snapshot.get("timestamp")
+
+    if intent == "medications_today":
+        if not slots:
+            return f"{patient_name}: no medication doses are scheduled for today."
+        lines = [_format_slot_line(s) for s in sorted(slots, key=lambda x: x.get("scheduled_for", ""))[:12]]
+        return (
+            f"{patient_name} medications for today (as of {ts}):\n"
+            + "\n".join(lines)
+            + f"\nSummary: expected {mar_summary.get('expected', 0)}, taken {mar_summary.get('taken_total', 0)}, "
+              f"due {mar_summary.get('due', 0)}, overdue {mar_summary.get('overdue', 0)}, missed {mar_summary.get('missed', 0)}."
+        )
+
+    if intent == "missed_doses":
+        if not missed:
+            return f"{patient_name}: no missed/overdue doses currently detected."
+        lines = []
+        for dose in missed[:10]:
+            lines.append(
+                f"- {dose.get('name', 'Medication')} ({dose.get('dosage', '')}) "
+                f"scheduled {dose.get('scheduled_for')}, overdue {dose.get('hours_overdue', 0)}h"
+            )
+        return f"{patient_name} missed doses:\n" + "\n".join(lines)
+
+    if intent == "safety_alerts":
+        if not open_alerts:
+            return f"{patient_name}: no open safety alerts right now."
+        lines = [_format_safety_alert_line(a) for a in open_alerts[:10]]
+        return f"{patient_name} open safety alerts ({len(open_alerts)}):\n" + "\n".join(lines)
+
+    if intent == "mood_behavior":
+        return (
+            f"{patient_name} mood/behavior (30 days): "
+            f"{bpsd.get('total_observations', 0)} BPSD events, "
+            f"average mood {bpsd.get('average_mood_score', 0)}, "
+            f"low mood days {bpsd.get('low_mood_days', 0)}, "
+            f"top symptom {bpsd.get('top_symptom') or 'none'}."
+        )
+
+    if intent == "today_instructions":
+        if not due_instructions and not as_needed_instructions:
+            return f"{patient_name}: no active care instructions for today."
+        due_lines = [
+            f"- {inst.get('title')} ({inst.get('time_of_day') or 'any time'})"
+            for inst in due_instructions[:8]
+        ]
+        as_needed_lines = [f"- {inst.get('title')}" for inst in as_needed_instructions[:5]]
+        parts = [f"{patient_name} care instructions for today:"]
+        if due_lines:
+            parts.append("Scheduled:")
+            parts.extend(due_lines)
+        if as_needed_lines:
+            parts.append("As needed:")
+            parts.extend(as_needed_lines)
+        return "\n".join(parts)
+
+    if intent == "compliance_check":
+        expected = int(mar_summary.get("expected", 0))
+        taken_total = int(mar_summary.get("taken_total", 0))
+        remaining_med_doses = max(expected - taken_total, 0)
+        if expected == 0:
+            med_line = "No medication doses scheduled today."
+        elif remaining_med_doses == 0:
+            med_line = f"Medication schedule is complete today ({taken_total}/{expected})."
+        else:
+            med_line = f"Medication schedule is not complete: {taken_total}/{expected} taken, {remaining_med_doses} pending."
+        # Instruction completion tracking does not exist yet in the data model.
+        instr_line = (
+            f"Active instructions due today: {len(due_instructions)}. "
+            "Instruction completion tracking is not implemented yet, so fulfillment cannot be fully auto-verified."
+        )
+        return f"{patient_name} compliance check: {med_line} {instr_line}"
+
+    if intent == "full_report":
+        alert_count = len(open_alerts)
+        return (
+            f"{patient_name} full report (as of {ts}):\n"
+            f"- Adherence 7d: on-time {adherence.get('adherence_percent_on_time', 0)}%, total {adherence.get('adherence_percent_total', 0)}%, "
+            f"missed {adherence.get('missed_doses', 0)} doses.\n"
+            f"- Today's meds: expected {mar_summary.get('expected', 0)}, taken {mar_summary.get('taken_total', 0)}, "
+            f"due {mar_summary.get('due', 0)}, overdue {mar_summary.get('overdue', 0)}, missed {mar_summary.get('missed', 0)}.\n"
+            f"- Safety: {alert_count} open alerts.\n"
+            f"- Mood/BPSD 30d: {bpsd.get('total_observations', 0)} events, low mood days {bpsd.get('low_mood_days', 0)}, "
+            f"top symptom {bpsd.get('top_symptom') or 'none'}.\n"
+            f"- Care instructions: {len(due_instructions)} due today, {len(as_needed_instructions)} as needed."
+        )
+
+    if intent == "progress_summary":
+        return (
+            f"{patient_name} progress summary (as of {ts}): "
+            f"adherence on-time {adherence.get('adherence_percent_on_time', 0)}% "
+            f"(total {adherence.get('adherence_percent_total', 0)}%), "
+            f"today taken {mar_summary.get('taken_total', 0)}/{mar_summary.get('expected', 0)} doses, "
+            f"{len(open_alerts)} open safety alerts, "
+            f"low mood days {bpsd.get('low_mood_days', 0)} in last 30 days."
+        )
+
+    return (
+        f"I can report medications, missed doses, safety alerts, mood/behavior, care instructions, "
+        f"and full progress for {patient_name}. Ask for one of those directly."
+    )
+
+AGENTIC_BOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_patient_data",
+            "description": "Query patient snapshot data including medications, adherence, safety alerts, mood, and care instructions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data_type": {
+                        "type": "string",
+                        "enum": ["medications_today", "missed_doses", "safety_alerts", "mood_behavior",
+                                 "today_instructions", "compliance_check", "full_report", "progress_summary"],
+                        "description": "The type of patient data to query"
+                    }
+                },
+                "required": ["data_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_medication",
+            "description": "Add a new medication prescription for the patient. Use when the doctor wants to prescribe or add a medication.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Full description of the medication to add, e.g. 'Metformin 500mg twice daily at 8am and 8pm'"
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_care_instruction",
+            "description": "Add a care instruction or protocol for the patient.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Full description of the care instruction, e.g. 'Check blood pressure daily at 9am'"
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deactivate_medication",
+            "description": "Stop/deactivate a medication for the patient.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "medication_name": {
+                        "type": "string",
+                        "description": "Name of the medication to deactivate"
+                    }
+                },
+                "required": ["medication_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_patient_intake",
+            "description": "Record that the patient took a specific medication dose.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "medication_name": {
+                        "type": "string",
+                        "description": "Name of the medication the patient took"
+                    }
+                },
+                "required": ["medication_name"]
+            }
+        }
+    }
+]
+
+
+async def compose_doctor_bot_response_with_llm(
+    question: str, snapshot: dict,
+    doctor_user: Optional[User] = None, patient_user_id: Optional[str] = None
+) -> str:
+    """Agentic LLM response with tool use — can both query and write patient data."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        return compose_doctor_bot_response("progress_summary", snapshot, question)
+
+    compact_snapshot = {
+        "patient": snapshot.get("patient"),
+        "timestamp": snapshot.get("timestamp"),
+        "adherence_7d": snapshot.get("adherence_7d"),
+        "today_medication_summary": ((snapshot.get("today_plan") or {}).get("medication_plan") or {}).get("summary", {}),
+        "today_instruction_counts": {
+            "due_today": len((((snapshot.get("today_plan") or {}).get("instructions") or {}).get("due_today") or [])),
+            "as_needed": len((((snapshot.get("today_plan") or {}).get("instructions") or {}).get("as_needed") or [])),
+        },
+        "open_safety_alert_count": len(snapshot.get("open_safety_alerts") or []),
+        "mood_behavior_30d": snapshot.get("bpsd_analytics_30d")
+    }
+
+    system_prompt = (
+        "You are an intelligent clinical assistant for doctors managing patients with dementia.\n"
+        "You can both QUERY patient data and PERFORM ACTIONS (add medications, care instructions, etc.).\n"
+        "Use the available tools to fulfill the doctor's request.\n"
+        "After tool calls, provide a clear summary of what was done or found.\n"
+        "Keep responses concise (under 8 bullet points) with concrete numbers.\n"
+        "If the doctor asks to do something you can't, explain what alternatives are available.\n"
+        f"\nCurrent patient data snapshot:\n{json.dumps(compact_snapshot)}"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question}
+    ]
+
+    # Unknown-intent fallback is READ-ONLY.  Write operations must go through
+    # the explicit intent classification path (heuristic → model) which is
+    # checked *before* this function is called.  Allowing the LLM fallback to
+    # invoke write tools would let ambiguous prompts mutate records.
+    can_write = False
+    tools = [AGENTIC_BOT_TOOLS[0]]  # query_patient_data only
+
+    try:
+        client = get_openai_client()
+        max_iterations = 3
+        for _iteration in range(max_iterations):
+            completion = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                max_tokens=500,
+                messages=messages,
+                tools=tools
+            )
+
+            choice = completion.choices[0]
+            message = choice.message
+
+            # No tool calls — return the text response
+            if not message.tool_calls:
+                return (message.content or "").strip() or compose_doctor_bot_response("progress_summary", snapshot, question)
+
+            # Process tool calls
+            messages.append(message)
+            for tool_call in message.tool_calls:
+                fn_name = tool_call.function.name
+                try:
+                    args = json.loads(tool_call.function.arguments or "{}")
+                except Exception:
+                    args = {}
+
+                result = ""
+                if fn_name == "query_patient_data":
+                    data_type = args.get("data_type", "progress_summary")
+                    result = compose_doctor_bot_response(data_type, snapshot, question)
+
+                elif fn_name == "add_medication" and can_write:
+                    result = await handle_bot_add_medication(
+                        doctor_user, patient_user_id, args.get("description", question)
+                    )
+
+                elif fn_name == "add_care_instruction" and can_write:
+                    result = await handle_bot_add_care_instruction(
+                        doctor_user, patient_user_id, args.get("description", question)
+                    )
+
+                elif fn_name == "deactivate_medication" and can_write:
+                    result = await handle_bot_deactivate_medication(
+                        doctor_user, patient_user_id,
+                        f"stop {args.get('medication_name', '')}"
+                    )
+
+                elif fn_name == "log_patient_intake" and can_write:
+                    result = await handle_bot_log_patient_intake(
+                        doctor_user, patient_user_id,
+                        f"mark {args.get('medication_name', '')} as taken"
+                    )
+                else:
+                    result = f"Tool '{fn_name}' is not available in current context."
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+
+        # If we exhausted iterations, get final response
+        final = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=300,
+            messages=messages
+        )
+        return (final.choices[0].message.content or "").strip() or "Request processed."
+
+    except Exception as exc:
+        logger.warning(f"Agentic doctor bot LLM failed: {exc}")
+    return compose_doctor_bot_response("progress_summary", snapshot, question)
+
+async def generate_tts_audio_bytes(text: str, voice: str = "nova") -> Optional[bytes]:
+    if not text or not os.environ.get("OPENAI_API_KEY"):
+        return None
+    try:
+        client = get_openai_client()
+        response = await client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=text[:4000],
+            speed=0.9
+        )
+        return response.content
+    except Exception as exc:
+        logger.warning(f"TTS generation for external bot failed: {exc}")
+        return None
+
+async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.ogg") -> Optional[str]:
+    if not audio_bytes or not os.environ.get("OPENAI_API_KEY"):
+        return None
+    try:
+        client = get_openai_client()
+        stream = io.BytesIO(audio_bytes)
+        stream.name = filename
+        result = await client.audio.transcriptions.create(
+            model=os.environ.get("STT_MODEL", "gpt-4o-mini-transcribe"),
+            file=stream
+        )
+        text = getattr(result, "text", None)
+        return text.strip() if text else None
+    except Exception as exc:
+        logger.warning(f"Audio transcription failed: {exc}")
+        return None
+
+async def download_telegram_voice_file(file_id: str) -> Tuple[Optional[bytes], Optional[str]]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return None, None
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            file_meta_resp = await client.post(
+                f"https://api.telegram.org/bot{token}/getFile",
+                json={"file_id": file_id}
+            )
+            file_meta = file_meta_resp.json() if file_meta_resp.status_code == 200 else {}
+            file_path = (file_meta.get("result") or {}).get("file_path")
+            if not file_path:
+                return None, None
+            file_resp = await client.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
+            if file_resp.status_code != 200:
+                return None, None
+            name = file_path.split("/")[-1] if "/" in file_path else "telegram_audio.ogg"
+            return file_resp.content, name
+    except Exception as exc:
+        logger.warning(f"Telegram voice download failed: {exc}")
+        return None, None
+
+async def download_twilio_media(media_url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    if not media_url:
+        return None, None
+    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    auth = (sid, token) if sid and token else None
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            resp = await client.get(media_url, auth=auth)
+            if resp.status_code != 200:
+                return None, None
+            content_type = resp.headers.get("content-type")
+            return resp.content, content_type
+    except Exception as exc:
+        logger.warning(f"Twilio media download failed: {exc}")
+        return None, None
+
+async def send_telegram_text_message(chat_id: str, text: str) -> dict:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return {"sent": False, "reason": "telegram_token_missing"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text[:4000]}
+            )
+        return {"sent": 200 <= resp.status_code < 300, "status_code": resp.status_code}
+    except Exception as exc:
+        return {"sent": False, "reason": str(exc)[:240]}
+
+async def send_telegram_voice_message(chat_id: str, text: str) -> dict:
+    """Send a voice note via Telegram.
+
+    Telegram's ``sendVoice`` expects OGG/Opus, but OpenAI TTS returns MP3.
+    We first try ``sendVoice`` with the MP3 (Telegram *sometimes* accepts it).
+    If that fails or is unavailable we fall back to ``sendAudio`` which is
+    format-agnostic and reliably delivers the audio file.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return {"sent": False, "reason": "telegram_token_missing"}
+    audio = await generate_tts_audio_bytes(text)
+    if not audio:
+        return {"sent": False, "reason": "tts_unavailable"}
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            # Try sendAudio (format-agnostic, always works with MP3).
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendAudio",
+                data={"chat_id": chat_id, "title": "Voice summary"},
+                files={"audio": ("summary.mp3", audio, "audio/mpeg")}
+            )
+        return {"sent": 200 <= resp.status_code < 300, "status_code": resp.status_code}
+    except Exception as exc:
+        return {"sent": False, "reason": str(exc)[:240]}
+
+async def log_external_bot_message(
+    channel: str,
+    peer_id: str,
+    doctor_user_id: Optional[str],
+    patient_user_id: Optional[str],
+    incoming_text: Optional[str],
+    response_text: str,
+    intent: Optional[str],
+    status: str
+):
+    doc = {
+        "id": f"botmsg_{uuid.uuid4().hex[:12]}",
+        "channel": channel,
+        "peer_id": peer_id,
+        "doctor_user_id": doctor_user_id,
+        "patient_user_id": patient_user_id,
+        "incoming_text": incoming_text,
+        "response_text": response_text,
+        "intent": intent,
+        "status": status,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.external_bot_message_logs.insert_one(doc)
+
+async def handle_external_link_code_message(
+    channel: str,
+    peer_id: str,
+    peer_display_name: Optional[str],
+    text: str
+) -> str:
+    code_match = re.search(r"(?:/link|link)\s+([A-Za-z0-9]+)", text.strip(), flags=re.IGNORECASE)
+    if not code_match:
+        return "To connect this chat, send: /link YOUR_CODE"
+    code = code_match.group(1).strip().upper()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    code_doc = await db.external_bot_link_codes.find_one(
+        {"code": code, "status": "pending"},
+        {"_id": 0}
+    )
+    if not code_doc:
+        return "Link code not found or already used. Generate a new one from the app."
+    if code_doc.get("channel") != channel:
+        return f"This code is for {code_doc.get('channel')} only."
+    if code_doc.get("expires_at", now_iso) < now_iso:
+        await db.external_bot_link_codes.update_one({"id": code_doc["id"]}, {"$set": {"status": "expired"}})
+        return "This link code has expired. Generate a new one from the app."
+
+    doctor_doc = await db.users.find_one({"user_id": code_doc.get("doctor_user_id")}, {"_id": 0})
+    if not doctor_doc:
+        return "Doctor account not found for this code."
+    doctor_user = User(**doctor_doc)
+    if not role_can_use_external_bot(doctor_user):
+        return "This account is not allowed to use external bot access."
+
+    normalized_peer = normalize_external_peer_id(channel, peer_id)
+    existing = await db.external_bot_links.find_one(
+        {"channel": channel, "peer_id": normalized_peer},
+        {"_id": 0}
+    )
+    link_doc = {
+        "id": existing.get("id") if existing else f"extlink_{uuid.uuid4().hex[:12]}",
+        "channel": channel,
+        "peer_id": normalized_peer,
+        "peer_display_name": peer_display_name,
+        "doctor_user_id": doctor_user.user_id,
+        "patient_user_id": code_doc.get("patient_user_id"),
+        "active": True,
+        "created_at": existing.get("created_at") if existing else now_iso,
+        "updated_at": now_iso,
+        "last_seen_at": now_iso
+    }
+    await db.external_bot_links.update_one(
+        {"id": link_doc["id"]},
+        {"$set": link_doc},
+        upsert=True
+    )
+    await db.external_bot_link_codes.update_one(
+        {"id": code_doc["id"]},
+        {"$set": {"status": "used", "used_at": now_iso, "used_by_peer_id": normalized_peer}}
+    )
+    patient_hint = ""
+    if code_doc.get("patient_user_id"):
+        patient = await db.users.find_one({"user_id": code_doc["patient_user_id"]}, {"_id": 0, "name": 1})
+        if patient:
+            patient_hint = f" Default patient set to {patient.get('name')}."
+    return f"Linked successfully to doctor account {doctor_user.name}.{patient_hint} You can now ask patient progress questions."
+
+
+# ==================== BOT WRITE HANDLERS ====================
+
+async def parse_medication_from_text(text: str) -> dict:
+    """Use LLM to extract medication details from natural language."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        return {}
+    prompt = (
+        "Extract medication prescription details from the doctor's message.\n"
+        "Return strict JSON:\n"
+        "{\n"
+        '  "name": "medication name",\n'
+        '  "dosage": "e.g. 500mg",\n'
+        '  "frequency": "daily|twice_daily|three_times_daily|every_other_day|weekly|custom",\n'
+        '  "times_per_day": 1,\n'
+        '  "scheduled_times": ["HH:MM", ...],\n'
+        '  "instructions": "optional special instructions",\n'
+        '  "prescribing_doctor": "doctor name if mentioned"\n'
+        "}\n"
+        "For frequency mapping:\n"
+        "- once a day / daily → daily, times_per_day=1\n"
+        "- twice a day / bid → twice_daily, times_per_day=2\n"
+        "- three times a day / tid → three_times_daily, times_per_day=3\n"
+        "- every other day → every_other_day\n"
+        "- weekly / once a week → weekly\n"
+        "Convert times like '8am' to '08:00', '8pm' to '20:00'.\n"
+        "If no times specified, use reasonable defaults based on frequency.\n"
+    )
+    try:
+        client = get_openai_client()
+        completion = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=200,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ]
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.warning(f"parse_medication_from_text failed: {e}")
+        return {}
+
+
+async def parse_care_instruction_from_text(text: str) -> dict:
+    """Use LLM to extract care instruction details from natural language."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        return {}
+    prompt = (
+        "Extract care instruction details from the doctor's message.\n"
+        "Return strict JSON:\n"
+        "{\n"
+        '  "title": "short title for the instruction",\n'
+        '  "instruction_text": "full instruction text",\n'
+        '  "summary": "brief summary",\n'
+        '  "frequency": "daily|weekly|as_needed",\n'
+        '  "time_of_day": "morning|afternoon|evening|null",\n'
+        '  "policy_type": "general|medication",\n'
+        '  "day_of_week": "monday|tuesday|...|null (only for weekly)"\n'
+        "}\n"
+        "If the instruction is about medications, set policy_type to 'medication'.\n"
+        "For general care procedures, set policy_type to 'general'.\n"
+    )
+    try:
+        client = get_openai_client()
+        completion = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ]
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        logger.warning(f"parse_care_instruction_from_text failed: {e}")
+        return {}
+
+
+async def handle_bot_add_medication(
+    doctor_user: User, patient_user_id: str, text: str
+) -> str:
+    """Parse and create a medication from a doctor's bot message."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    parsed = await parse_medication_from_text(text)
+    name = (parsed.get("name") or "").strip()
+    dosage = (parsed.get("dosage") or "").strip()
+    if not name:
+        return "I could not identify the medication name. Please specify, e.g.: 'Add medication Metformin 500mg twice daily at 8am and 8pm'"
+
+    frequency = parsed.get("frequency", "daily")
+    times_per_day = int(parsed.get("times_per_day", 1))
+    scheduled_times = parsed.get("scheduled_times", [])
+    cleaned_times = [normalize_hhmm(t) for t in scheduled_times if t]
+
+    med_obj = Medication(
+        user_id=owner_id,
+        name=name,
+        dosage=dosage or "as prescribed",
+        frequency=frequency,
+        times_per_day=times_per_day,
+        scheduled_times=cleaned_times,
+        prescribing_doctor=parsed.get("prescribing_doctor") or doctor_user.name,
+        instructions=parsed.get("instructions")
+    )
+    doc = med_obj.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+    await db.medications.insert_one(doc)
+    asyncio.create_task(notify_patient_update(
+        owner_id, "medication_added",
+        f"{doctor_user.name} prescribed {name}. Ask your voice assistant for details."
+    ))
+
+    patient = await db.users.find_one({"user_id": owner_id}, {"_id": 0, "name": 1})
+    patient_name = (patient or {}).get("name", owner_id)
+    times_str = ", ".join([format_hhmm_for_voice(t) for t in cleaned_times]) if cleaned_times else "no specific times"
+    return (
+        f"Medication created for {patient_name}:\n"
+        f"- Name: {name}\n"
+        f"- Dosage: {dosage or 'as prescribed'}\n"
+        f"- Frequency: {frequency.replace('_', ' ')}\n"
+        f"- Scheduled times: {times_str}\n"
+        f"- Prescribed by: {med_obj.prescribing_doctor or 'N/A'}"
+    )
+
+
+async def handle_bot_add_care_instruction(
+    doctor_user: User, patient_user_id: str, text: str
+) -> str:
+    """Parse and create a care instruction from a doctor's bot message."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    parsed = await parse_care_instruction_from_text(text)
+    title = (parsed.get("title") or "").strip()
+    instruction_text = (parsed.get("instruction_text") or "").strip()
+    if not title or not instruction_text:
+        return "I could not parse the instruction details. Please specify, e.g.: 'Add instruction: Check blood pressure daily at 9am'"
+
+    policy_type = normalize_policy_type(parsed.get("policy_type", "general"))
+    frequency = normalize_frequency(parsed.get("frequency", "daily"))
+    signoff_required = policy_type == "medication"
+    signoff_status = normalize_signoff_status(None, signoff_required)
+    regimen_key = re.sub(r"\s+", "_", title.lower()) if policy_type == "medication" else None
+
+    version_query = {"user_id": owner_id, "policy_type": policy_type}
+    if regimen_key:
+        version_query["regimen_key"] = regimen_key
+    latest = await db.care_instructions.find_one(version_query, {"_id": 0}, sort=[("version", -1)])
+    next_version = int(latest.get("version", 0) + 1) if latest else 1
+
+    instruction_obj = CareInstruction(
+        user_id=owner_id,
+        title=title,
+        instruction_text=instruction_text,
+        summary=parsed.get("summary"),
+        frequency=frequency,
+        day_of_week=normalize_day_of_week(parsed.get("day_of_week")),
+        time_of_day=(parsed.get("time_of_day") or "").strip() or None,
+        policy_type=policy_type,
+        regimen_key=regimen_key,
+        version=next_version,
+        status="draft" if signoff_required else "active",
+        signoff_required=signoff_required,
+        signoff_status=signoff_status,
+        active=not signoff_required,
+        uploaded_by_user_id=doctor_user.user_id,
+        uploaded_by_role=doctor_user.role
+    )
+    doc = instruction_obj.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+    doc["search_text"] = build_instruction_search_text(doc)
+    await db.care_instructions.insert_one(doc)
+    await upsert_instruction_chunks(doc)
+    asyncio.create_task(notify_patient_update(
+        owner_id, "instruction_added",
+        f"{doctor_user.name} added: {title}. Ask your voice assistant about it."
+    ))
+
+    patient = await db.users.find_one({"user_id": owner_id}, {"_id": 0, "name": 1})
+    patient_name = (patient or {}).get("name", owner_id)
+    signoff_note = " (requires clinician signoff before becoming active)" if signoff_required else ""
+    return (
+        f"Care instruction created for {patient_name}:\n"
+        f"- Title: {title}\n"
+        f"- Frequency: {frequency}\n"
+        f"- Type: {policy_type}\n"
+        f"- Status: {'draft' if signoff_required else 'active'}{signoff_note}"
+    )
+
+
+async def handle_bot_deactivate_medication(
+    doctor_user: User, patient_user_id: str, text: str
+) -> str:
+    """Deactivate a medication by matching name from the doctor's message."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    meds = await db.medications.find(
+        {"user_id": owner_id, "active": True}, {"_id": 0}
+    ).to_list(100)
+    if not meds:
+        return "This patient has no active medications to deactivate."
+
+    # Extract medication name from text using LLM
+    parsed = await parse_medication_from_text(text)
+    target_name = (parsed.get("name") or "").strip().lower()
+
+    # Fuzzy match against active medications
+    matched = None
+    for med in meds:
+        med_name = (med.get("name") or "").lower()
+        if target_name and (target_name in med_name or med_name in target_name):
+            matched = med
+            break
+        # Word-level match
+        for word in target_name.split():
+            if len(word) > 3 and word in med_name:
+                matched = med
+                break
+        if matched:
+            break
+
+    if not matched:
+        names = [f"- {m.get('name', '')} ({m.get('dosage', '')})" for m in meds[:10]]
+        return f"Could not identify which medication to deactivate. Active medications:\n" + "\n".join(names)
+
+    await db.medications.update_one(
+        {"id": matched["id"], "user_id": owner_id},
+        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return f"Deactivated medication: {matched.get('name', '')} ({matched.get('dosage', '')})"
+
+
+async def handle_bot_log_patient_intake(
+    doctor_user: User, patient_user_id: str, text: str
+) -> str:
+    """Log a medication intake for a patient from a doctor/caregiver bot message."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    meds = await db.medications.find(
+        {"user_id": owner_id, "active": True}, {"_id": 0}
+    ).to_list(100)
+    if not meds:
+        return "This patient has no active medications."
+
+    parsed = await parse_medication_from_text(text)
+    target_name = (parsed.get("name") or "").strip().lower()
+
+    matched = None
+    for med in meds:
+        med_name = (med.get("name") or "").lower()
+        if target_name and (target_name in med_name or med_name in target_name):
+            matched = med
+            break
+        for word in target_name.split():
+            if len(word) > 3 and word in med_name:
+                matched = med
+                break
+        if matched:
+            break
+
+    if not matched:
+        if len(meds) == 1:
+            matched = meds[0]
+        else:
+            names = [f"- {m.get('name', '')} ({m.get('dosage', '')})" for m in meds[:10]]
+            return f"Could not identify which medication. Active medications:\n" + "\n".join(names)
+
+    now_utc = datetime.now(timezone.utc)
+    log_obj = MedicationIntakeLog(
+        user_id=owner_id,
+        medication_id=matched["id"],
+        status="taken",
+        source="caregiver",
+        notes=f"Logged by {doctor_user.name} via bot",
+        recorded_by_user_id=doctor_user.user_id,
+        confirmed_at=now_utc
+    )
+    doc = log_obj.model_dump()
+    doc["confirmed_at"] = doc["confirmed_at"].isoformat()
+    await db.medication_intake_logs.insert_one(doc)
+
+    return f"Recorded intake: {matched.get('name', '')} ({matched.get('dosage', '')}) marked as taken."
+
+
+async def handle_bot_update_medication(
+    doctor_user: User, patient_user_id: str, text: str
+) -> str:
+    """Update an existing medication from a doctor's bot message."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    meds = await db.medications.find(
+        {"user_id": owner_id, "active": True}, {"_id": 0}
+    ).to_list(100)
+    if not meds:
+        return "This patient has no active medications to update."
+
+    parsed = await parse_medication_from_text(text)
+    target_name = (parsed.get("name") or "").strip().lower()
+
+    matched = None
+    for med in meds:
+        med_name = (med.get("name") or "").lower()
+        if target_name and (target_name in med_name or med_name in target_name):
+            matched = med
+            break
+        for word in target_name.split():
+            if len(word) > 3 and word in med_name:
+                matched = med
+                break
+        if matched:
+            break
+
+    if not matched:
+        names = [f"- {m.get('name', '')} ({m.get('dosage', '')})" for m in meds[:10]]
+        return "Could not identify which medication to update. Active medications:\n" + "\n".join(names)
+
+    update_fields = {}
+    if parsed.get("dosage"):
+        update_fields["dosage"] = parsed["dosage"]
+    if parsed.get("frequency"):
+        update_fields["frequency"] = parsed["frequency"]
+    if parsed.get("scheduled_times"):
+        update_fields["scheduled_times"] = [normalize_hhmm(t) for t in parsed["scheduled_times"] if t]
+    if parsed.get("times_per_day"):
+        update_fields["times_per_day"] = int(parsed["times_per_day"])
+    if parsed.get("instructions"):
+        update_fields["instructions"] = parsed["instructions"]
+
+    if not update_fields:
+        return f"Could not determine what to change for {matched.get('name', '')}. Please specify, e.g.: 'Update metformin dosage to 1000mg'"
+
+    update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.medications.update_one(
+        {"id": matched["id"], "user_id": owner_id},
+        {"$set": update_fields}
+    )
+
+    changes = ", ".join(f"{k}={v}" for k, v in update_fields.items() if k != "updated_at")
+    return f"Updated {matched.get('name', '')}: {changes}"
+
+
+# ==================== BOT QUERY HANDLER ====================
+
+async def handle_external_doctor_query(
+    doctor_user: User,
+    question: str,
+    patient_user_id: str
+) -> Tuple[str, str, dict]:
+    intent = classify_doctor_bot_intent_heuristic(question)
+    if intent == "unknown":
+        intent = await classify_doctor_bot_intent_model(question)
+
+    # Handle write intents
+    if intent in DOCTOR_BOT_WRITE_INTENTS:
+        if intent == "add_medication":
+            response = await handle_bot_add_medication(doctor_user, patient_user_id, question)
+        elif intent == "add_care_instruction":
+            response = await handle_bot_add_care_instruction(doctor_user, patient_user_id, question)
+        elif intent == "deactivate_medication":
+            response = await handle_bot_deactivate_medication(doctor_user, patient_user_id, question)
+        elif intent == "log_patient_intake":
+            response = await handle_bot_log_patient_intake(doctor_user, patient_user_id, question)
+        elif intent == "update_medication":
+            response = await handle_bot_update_medication(doctor_user, patient_user_id, question)
+        else:
+            response = "Write operation not yet supported."
+        return response, intent, {}
+
+    # Handle read intents
+    snapshot = await build_doctor_patient_snapshot(patient_user_id, doctor_user)
+    if intent == "unknown":
+        response = await compose_doctor_bot_response_with_llm(question, snapshot, doctor_user, patient_user_id)
+    else:
+        response = compose_doctor_bot_response(intent, snapshot, question)
+    return response, intent, snapshot
+
+async def handle_external_doctor_message(
+    channel: str,
+    peer_id: str,
+    peer_display_name: Optional[str],
+    text: str,
+    prefer_voice: bool = False
+) -> dict:
+    message_text = (text or "").strip()
+    normalized_peer = normalize_external_peer_id(channel, peer_id)
+
+    if re.match(r"^\s*(/link|link)\b", message_text, flags=re.IGNORECASE):
+        response_text = await handle_external_link_code_message(channel, normalized_peer, peer_display_name, message_text)
+        await log_external_bot_message(channel, normalized_peer, None, None, message_text, response_text, "link", "ok")
+        return {"text": response_text, "voice_text": response_text if prefer_voice else None, "status": "ok", "intent": "link"}
+
+    link = await db.external_bot_links.find_one(
+        {"channel": channel, "peer_id": normalized_peer, "active": True},
+        {"_id": 0}
+    )
+    if not link:
+        response_text = "This chat is not linked yet. In the app, generate a bot link code and send: /link YOUR_CODE"
+        await log_external_bot_message(channel, normalized_peer, None, None, message_text, response_text, "unlinked", "error")
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "unlinked"}
+
+    doctor_doc = await db.users.find_one({"user_id": link.get("doctor_user_id")}, {"_id": 0})
+    if not doctor_doc:
+        response_text = "Linked doctor account was not found. Please relink this chat."
+        await log_external_bot_message(channel, normalized_peer, link.get("doctor_user_id"), None, message_text, response_text, "doctor_missing", "error")
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "doctor_missing"}
+
+    doctor_user = User(**doctor_doc)
+    if not role_can_use_external_bot(doctor_user):
+        response_text = "This account role is not allowed to use the external doctor bot."
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "forbidden_role", "error")
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "forbidden_role"}
+    if doctor_user.role == "clinician" and doctor_user.clinician_approval_status != "approved":
+        response_text = "Clinician account is not approved for bot access."
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "clinician_unapproved", "error")
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "clinician_unapproved"}
+
+    if not _is_premium(doctor_doc):
+        response_text = (
+            "External bot access requires AlzaHelp Premium ($9.99/mo). "
+            "Visit your dashboard to upgrade and unlock Telegram/WhatsApp monitoring."
+        )
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "premium_required", "error")
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "premium_required"}
+
+    if re.match(r"^\s*/patient\b", message_text, flags=re.IGNORECASE):
+        parts = message_text.split()
+        if len(parts) < 2:
+            response_text = "Usage: /patient user_xxxxxxxxxxxx"
+            await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "patient_select", "error")
+            return {"text": response_text, "voice_text": None, "status": "error", "intent": "patient_select"}
+        requested_id = parts[1].strip()
+        try:
+            owner_id = await resolve_target_user_id(doctor_user, requested_id)
+        except HTTPException:
+            response_text = "You do not have access to that patient."
+            await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, requested_id, message_text, response_text, "patient_select", "error")
+            return {"text": response_text, "voice_text": None, "status": "error", "intent": "patient_select"}
+
+        await db.external_bot_links.update_one(
+            {"id": link["id"]},
+            {"$set": {"patient_user_id": owner_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        patient_doc = await db.users.find_one({"user_id": owner_id}, {"_id": 0, "name": 1})
+        response_text = f"Default patient set to {patient_doc.get('name') if patient_doc else owner_id}."
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, owner_id, message_text, response_text, "patient_select", "ok")
+        return {"text": response_text, "voice_text": None, "status": "ok", "intent": "patient_select"}
+
+    explicit_patient_id = extract_patient_id_from_text(message_text)
+    selected_patient_id = explicit_patient_id or link.get("patient_user_id")
+    if selected_patient_id:
+        try:
+            selected_patient_id = await resolve_target_user_id(doctor_user, selected_patient_id)
+        except HTTPException:
+            selected_patient_id = None
+
+    if not selected_patient_id:
+        accessible = await get_doctor_accessible_patients(doctor_user, limit=10)
+        if len(accessible) == 1:
+            selected_patient_id = accessible[0]["user_id"]
+            await db.external_bot_links.update_one(
+                {"id": link["id"]},
+                {"$set": {"patient_user_id": selected_patient_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+            )
+        else:
+            if not accessible:
+                response_text = "No linked patients found for this account."
+            else:
+                listing = "\n".join([f"- {p.get('name', p['user_id'])}: {p['user_id']}" for p in accessible[:10]])
+                response_text = (
+                    "Please select a patient first using /patient <patient_user_id>.\n"
+                    f"Available patients:\n{listing}"
+                )
+            await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "patient_required", "error")
+            return {"text": response_text, "voice_text": None, "status": "error", "intent": "patient_required"}
+
+    try:
+        response_text, intent, _snapshot = await handle_external_doctor_query(
+            doctor_user=doctor_user,
+            question=message_text,
+            patient_user_id=selected_patient_id
+        )
+        await db.external_bot_links.update_one(
+            {"id": link["id"]},
+            {
+                "$set": {
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "peer_display_name": peer_display_name or link.get("peer_display_name")
+                }
+            }
+        )
+        await log_external_bot_message(
+            channel,
+            normalized_peer,
+            doctor_user.user_id,
+            selected_patient_id,
+            message_text,
+            response_text,
+            intent,
+            "ok"
+        )
+        return {
+            "text": response_text,
+            "voice_text": response_text if prefer_voice else None,
+            "status": "ok",
+            "intent": intent,
+            "patient_user_id": selected_patient_id
+        }
+    except HTTPException as exc:
+        response_text = f"Could not complete request: {exc.detail}"
+        await log_external_bot_message(
+            channel,
+            normalized_peer,
+            doctor_user.user_id,
+            selected_patient_id,
+            message_text,
+            response_text,
+            "query_error",
+            "error"
+        )
+        return {"text": response_text, "voice_text": None, "status": "error", "intent": "query_error"}
+
 @api_router.get("/medications", response_model=List[dict])
 async def get_medications(
     target_user_id: Optional[str] = None,
@@ -3233,6 +5338,7 @@ async def create_medication(
     target_user_id: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
+    guard_demo_write(current_user)
     owner_id = await resolve_target_user_id(current_user, target_user_id, require_write=True)
     cleaned_times = [normalize_hhmm(t) for t in medication.scheduled_times if t]
     med_obj = Medication(
@@ -3243,6 +5349,11 @@ async def create_medication(
     doc["created_at"] = doc["created_at"].isoformat()
     doc["updated_at"] = doc["updated_at"].isoformat()
     await db.medications.insert_one(doc)
+    if owner_id != current_user.user_id:
+        asyncio.create_task(notify_patient_update(
+            owner_id, "medication_added",
+            f"{current_user.name} added {medication.name} ({medication.dosage or 'as prescribed'}). Open the app to review."
+        ))
     if "_id" in doc:
         del doc["_id"]
     return doc
@@ -3254,6 +5365,7 @@ async def update_medication(
     target_user_id: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
+    guard_demo_write(current_user)
     owner_id = await resolve_target_user_id(current_user, target_user_id, require_write=True)
     update_data = {k: v for k, v in medication.model_dump().items() if v is not None}
     if "scheduled_times" in update_data:
@@ -3274,6 +5386,7 @@ async def delete_medication(
     target_user_id: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
+    guard_demo_write(current_user)
     owner_id = await resolve_target_user_id(current_user, target_user_id, require_write=True)
     result = await db.medications.delete_one({"id": medication_id, "user_id": owner_id})
     if result.deleted_count == 0:
@@ -3818,6 +5931,19 @@ async def accept_care_invite(
     if current_user.role not in {"caregiver", "clinician"}:
         raise HTTPException(status_code=403, detail="Only caregiver or clinician accounts can accept invites")
 
+    # Enforce patient limit per subscription tier
+    current_count = await db.care_links.count_documents(
+        {"caregiver_id": current_user.user_id, "status": "accepted"}
+    )
+    user_doc = await db.users.find_one({"user_id": current_user.user_id}, {"_id": 0, "subscription_tier": 1})
+    tier = (user_doc or {}).get("subscription_tier", "free")
+    limit = PATIENT_LIMITS.get(tier, 3)
+    if current_count >= limit:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Patient limit reached ({limit}). Upgrade to add more patients."
+        )
+
     existing = await db.care_links.find_one(
         {"patient_id": invite["patient_id"], "caregiver_id": current_user.user_id, "status": "accepted"},
         {"_id": 0}
@@ -3866,6 +5992,175 @@ async def get_care_links(current_user: User = Depends(get_current_user)):
             link["caregiver"] = caregiver_map.get(link["caregiver_id"])
 
     return {"as_patient": patient_links, "as_caregiver": caregiver_links}
+
+@api_router.get("/external-bot/patients", response_model=List[dict])
+async def get_external_bot_patients(current_user: User = Depends(get_current_user)):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    return await get_doctor_accessible_patients(current_user, limit=120)
+
+@api_router.post("/external-bot/link-codes", response_model=dict)
+async def create_external_bot_link_code_route(
+    payload: ExternalBotLinkCodeCreate,
+    current_user: User = Depends(get_current_user)
+):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    require_premium(current_user)
+    channel = normalize_external_bot_channel(payload.channel)
+    if not channel:
+        raise HTTPException(status_code=400, detail="channel must be telegram or whatsapp")
+
+    patient_user_id = None
+    if payload.patient_user_id:
+        patient_user_id = await resolve_target_user_id(current_user, payload.patient_user_id)
+
+    expires_minutes = max(5, min(int(payload.expires_in_minutes or 20), 240))
+    now = datetime.now(timezone.utc)
+    code = create_external_bot_link_code()
+    # Retry a few times to avoid rare collisions.
+    for _ in range(4):
+        exists = await db.external_bot_link_codes.find_one({"code": code, "status": "pending"}, {"_id": 0, "id": 1})
+        if not exists:
+            break
+        code = create_external_bot_link_code()
+
+    doc = {
+        "id": f"extcode_{uuid.uuid4().hex[:12]}",
+        "code": code,
+        "channel": channel,
+        "doctor_user_id": current_user.user_id,
+        "patient_user_id": patient_user_id,
+        "status": "pending",
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=expires_minutes)).isoformat()
+    }
+    await db.external_bot_link_codes.insert_one(doc)
+
+    if channel == "telegram":
+        instructions = f"Open your Telegram bot and send: /link {code}"
+    else:
+        instructions = f"Send WhatsApp message: /link {code}"
+
+    return {
+        "id": doc["id"],
+        "code": code,
+        "channel": channel,
+        "patient_user_id": patient_user_id,
+        "expires_at": doc["expires_at"],
+        "connect_instructions": instructions
+    }
+
+@api_router.get("/external-bot/links", response_model=List[dict])
+async def list_external_bot_links(current_user: User = Depends(get_current_user)):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    links = await db.external_bot_links.find(
+        {"doctor_user_id": current_user.user_id},
+        {"_id": 0}
+    ).sort("updated_at", -1).to_list(200)
+    if not links:
+        return []
+    patient_ids = [l.get("patient_user_id") for l in links if l.get("patient_user_id")]
+    patient_map = {}
+    if patient_ids:
+        patients = await db.users.find(
+            {"user_id": {"$in": patient_ids}},
+            {"_id": 0, "user_id": 1, "name": 1, "email": 1}
+        ).to_list(200)
+        patient_map = {p["user_id"]: p for p in patients}
+    for link in links:
+        pid = link.get("patient_user_id")
+        if pid:
+            link["patient"] = patient_map.get(pid)
+    return links
+
+@api_router.put("/external-bot/links/{link_id}/patient", response_model=dict)
+async def update_external_bot_link_patient(
+    link_id: str,
+    payload: ExternalBotLinkPatientUpdate,
+    current_user: User = Depends(get_current_user)
+):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    link = await db.external_bot_links.find_one(
+        {"id": link_id, "doctor_user_id": current_user.user_id, "active": True},
+        {"_id": 0}
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="External bot link not found")
+
+    patient_user_id = None
+    if payload.patient_user_id:
+        patient_user_id = await resolve_target_user_id(current_user, payload.patient_user_id)
+    await db.external_bot_links.update_one(
+        {"id": link_id},
+        {"$set": {"patient_user_id": patient_user_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    updated = await db.external_bot_links.find_one({"id": link_id}, {"_id": 0})
+    return updated
+
+@api_router.delete("/external-bot/links/{link_id}", response_model=dict)
+async def revoke_external_bot_link(
+    link_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    result = await db.external_bot_links.update_one(
+        {"id": link_id, "doctor_user_id": current_user.user_id, "active": True},
+        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="External bot link not found")
+    return {"message": "External bot link revoked"}
+
+@api_router.post("/external-bot/query", response_model=dict)
+async def external_bot_query(
+    payload: DoctorBotQueryRequest,
+    current_user: User = Depends(get_current_user)
+):
+    if not role_can_use_external_bot(current_user):
+        raise HTTPException(status_code=403, detail="Role not allowed for external bot")
+    question = (payload.text or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    patient_user_id = payload.patient_user_id
+    if patient_user_id:
+        patient_user_id = await resolve_target_user_id(current_user, patient_user_id)
+    else:
+        patients = await get_doctor_accessible_patients(current_user, limit=5)
+        if len(patients) == 1:
+            patient_user_id = patients[0]["user_id"]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple or zero patients available. Provide patient_user_id."
+            )
+
+    response_text, intent, snapshot = await handle_external_doctor_query(
+        doctor_user=current_user,
+        question=question,
+        patient_user_id=patient_user_id
+    )
+    voice_base64 = None
+    if payload.prefer_voice:
+        audio = await generate_tts_audio_bytes(response_text)
+        if audio:
+            voice_base64 = base64.b64encode(audio).decode("utf-8")
+    return {
+        "patient_user_id": patient_user_id,
+        "intent": intent,
+        "response": response_text,
+        "voice_base64": voice_base64,
+        "snapshot": {
+            "patient": snapshot.get("patient"),
+            "timestamp": snapshot.get("timestamp"),
+            "adherence_7d": snapshot.get("adherence_7d"),
+            "open_safety_alert_count": len(snapshot.get("open_safety_alerts") or [])
+        }
+    }
 
 @api_router.get("/care/patients/{patient_id}/dashboard", response_model=dict)
 async def get_caregiver_patient_dashboard(
@@ -4158,6 +6453,11 @@ async def create_care_instruction(
     doc["search_text"] = build_instruction_search_text(doc)
     await db.care_instructions.insert_one(doc)
     await upsert_instruction_chunks(doc)
+    if owner_id != current_user.user_id:
+        asyncio.create_task(notify_patient_update(
+            owner_id, "instruction_added",
+            f"{current_user.name} added a care instruction: {payload.title.strip()}. Your voice assistant has the details."
+        ))
 
     if doc["policy_type"] == "medication" and doc.get("status") == "active" and doc.get("regimen_key"):
         # Keep only one active medication regimen version at a time for a regimen_key.
@@ -4288,6 +6588,11 @@ async def create_care_instruction_with_upload(
     doc["search_text"] = build_instruction_search_text(doc)
     await db.care_instructions.insert_one(doc)
     await upsert_instruction_chunks(doc)
+    if owner_id != current_user.user_id:
+        asyncio.create_task(notify_patient_update(
+            owner_id, "instruction_added",
+            f"{current_user.name} added a care instruction: {title.strip()}. Your voice assistant has the details."
+        ))
     doc.pop("_id", None)
     doc.pop("search_text", None)
     return doc
@@ -4577,6 +6882,193 @@ async def get_daily_note(
         raise HTTPException(status_code=404, detail="Note not found")
     return note
 
+# ==================== DAILY DIGEST & REPORTS ====================
+
+@api_router.get("/care/patients/{patient_id}/daily-digest")
+async def daily_digest(patient_id: str, current_user: User = Depends(get_current_user)):
+    """Generate an AI-powered daily summary for a caregiver."""
+    await resolve_target_user_id(current_user, patient_id)
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    patient = await db.users.find_one({"user_id": patient_id}, {"_id": 0, "name": 1})
+    patient_name = patient.get("name", "Patient") if patient else "Patient"
+
+    meds = await db.medications.find({"user_id": patient_id, "active": True}, {"_id": 0}).to_list(50)
+    intakes = await db.medication_intake_logs.find({
+        "user_id": patient_id,
+        "taken_at": {"$regex": f"^{today}"}
+    }, {"_id": 0}).to_list(200)
+    mood = await db.mood_checkins.find({
+        "user_id": patient_id,
+        "created_at": {"$regex": f"^{today}"}
+    }, {"_id": 0}).to_list(10)
+    alerts = await db.safety_alerts.find({
+        "user_id": patient_id,
+        "created_at": {"$regex": f"^{today}"}
+    }, {"_id": 0}).to_list(50)
+
+    total_doses = sum(len(m.get("scheduled_times", [])) for m in meds)
+    taken_doses = len(intakes)
+    adherence = f"{taken_doses}/{total_doses}" if total_doses > 0 else "No medications scheduled"
+
+    mood_summary = "No check-in today"
+    if mood:
+        latest = mood[-1]
+        mood_summary = f"Mood: {latest.get('mood_score', '?')}/3, Energy: {latest.get('energy_level', '?')}/3"
+
+    alert_summary = f"{len(alerts)} safety alert(s)" if alerts else "No safety alerts"
+
+    prompt = f"""Summarize this patient's day in 3 concise, caring sentences for their caregiver. Patient name: {patient_name}.
+
+Medication adherence: {adherence}
+{mood_summary}
+{alert_summary}
+
+Be warm but factual. If adherence is low, mention it gently."""
+
+    try:
+        ai_client = get_openai_client()
+        resp = await ai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": "You are a healthcare assistant writing brief daily summaries for family caregivers."}, {"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.7
+        )
+        summary = resp.choices[0].message.content.strip()
+    except Exception:
+        summary = f"{patient_name}'s day: {adherence} medications taken. {mood_summary}. {alert_summary}."
+
+    return {
+        "patient_name": patient_name,
+        "date": today,
+        "summary": summary,
+        "adherence": adherence,
+        "mood": mood_summary,
+        "alerts": alert_summary
+    }
+
+
+@api_router.get("/care/patients/{patient_id}/report")
+async def care_report_pdf(
+    patient_id: str,
+    days: int = 30,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate a PDF care report for a patient."""
+    if not _HAS_REPORTLAB:
+        raise HTTPException(status_code=503, detail="PDF generation not available")
+
+    await resolve_target_user_id(current_user, patient_id)
+
+    patient = await db.users.find_one({"user_id": patient_id}, {"_id": 0, "name": 1, "email": 1})
+    patient_name = patient.get("name", "Patient") if patient else "Patient"
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    meds = await db.medications.find({"user_id": patient_id, "active": True}, {"_id": 0}).to_list(50)
+    intakes = await db.medication_intake_logs.find({"user_id": patient_id, "taken_at": {"$gte": cutoff}}, {"_id": 0}).to_list(5000)
+    moods = await db.mood_checkins.find({"user_id": patient_id, "created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(500)
+    alerts = await db.safety_alerts.find({"user_id": patient_id, "created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(500)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.75*inch, bottomMargin=0.75*inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('ReportTitle', parent=styles['Title'], fontSize=18, spaceAfter=20)
+    heading_style = ParagraphStyle('SectionHead', parent=styles['Heading2'], fontSize=14, spaceAfter=10, textColor=colors.HexColor('#7c3aed'))
+
+    story = []
+    story.append(Paragraph(f"AlzaHelp Care Report &mdash; {patient_name}", title_style))
+    story.append(Paragraph(f"Report period: Last {days} days | Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}", styles['Normal']))
+    story.append(Spacer(1, 20))
+
+    # Medications
+    story.append(Paragraph("Medications", heading_style))
+    if meds:
+        med_data = [["Medication", "Dosage", "Schedule"]]
+        for m in meds:
+            med_data.append([m.get("name", ""), m.get("dosage", ""), ", ".join(m.get("scheduled_times", []))])
+        tbl = Table(med_data, colWidths=[2.5*inch, 1.5*inch, 2*inch])
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#7c3aed')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f3ff')]),
+        ]))
+        story.append(tbl)
+    else:
+        story.append(Paragraph("No active medications.", styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Adherence
+    total_doses = len(intakes)
+    story.append(Paragraph("Medication Adherence", heading_style))
+    story.append(Paragraph(f"Total recorded intakes in period: {total_doses}", styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Mood
+    story.append(Paragraph("Mood &amp; Wellbeing", heading_style))
+    if moods:
+        avg_mood = sum(m.get("mood_score", 0) for m in moods) / len(moods)
+        avg_energy = sum(m.get("energy_level", 0) for m in moods) / len(moods)
+        story.append(Paragraph(f"Check-ins: {len(moods)} | Avg Mood: {avg_mood:.1f}/3 | Avg Energy: {avg_energy:.1f}/3", styles['Normal']))
+    else:
+        story.append(Paragraph("No mood check-ins recorded.", styles['Normal']))
+    story.append(Spacer(1, 15))
+
+    # Safety
+    story.append(Paragraph("Safety Events", heading_style))
+    story.append(Paragraph(f"Alerts in period: {len(alerts)}", styles['Normal']))
+    if alerts:
+        for a in alerts[:10]:
+            story.append(Paragraph(f"&bull; {a.get('type', 'alert')} &mdash; {a.get('created_at', '')[:10]}: {a.get('message', '')[:100]}", styles['Normal']))
+    story.append(Spacer(1, 20))
+
+    story.append(Paragraph("Generated by AlzaHelp &mdash; alzahelp.app", styles['Normal']))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    safe_name = patient_name.replace(' ', '_')
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=alzahelp_report_{safe_name}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.pdf"}
+    )
+
+
+# ==================== REFERRAL SHARING ====================
+
+@api_router.post("/referral/generate")
+async def generate_referral(current_user: User = Depends(get_current_user)):
+    """Generate a unique referral code for the current user."""
+    guard_demo_write(current_user)
+    user_doc = await db.users.find_one({"user_id": current_user.user_id}, {"_id": 0, "referral_code": 1})
+    existing_code = user_doc.get("referral_code") if user_doc else None
+
+    if existing_code:
+        count = await db.users.count_documents({"referred_by": existing_code})
+        return {"code": existing_code, "referral_count": count}
+
+    code = secrets.token_urlsafe(6)
+    await db.users.update_one(
+        {"user_id": current_user.user_id},
+        {"$set": {"referral_code": code}}
+    )
+    return {"code": code, "referral_count": 0}
+
+
+@api_router.get("/referral/stats")
+async def referral_stats(current_user: User = Depends(get_current_user)):
+    """Get referral statistics for the current user."""
+    user_doc = await db.users.find_one({"user_id": current_user.user_id}, {"_id": 0, "referral_code": 1})
+    code = user_doc.get("referral_code") if user_doc else None
+    if not code:
+        return {"code": None, "referral_count": 0}
+    count = await db.users.count_documents({"referred_by": code})
+    return {"code": code, "referral_count": count}
+
+
 # ==================== RAG CHAT ====================
 
 def keyword_match_score(query: str, text: str) -> float:
@@ -4742,48 +7234,52 @@ async def retrieve_instruction_semantic_context(
     }
 
 async def search_similar_content(user_id: str, query: str, top_k: int = 10) -> dict:
-    """Search for similar memories, family members, and care instructions."""
-    
-    # Get all memories
+    """Search for similar memories, family members, and care instructions using hybrid semantic+lexical scoring."""
+    query_embedding = await get_query_embedding(query)
+
     memories = await db.memories.find(
         {"user_id": user_id},
         {"_id": 0, "search_text": 0}
     ).to_list(500)
-    
-    # Get all family members
+
     family = await db.family_members.find(
         {"user_id": user_id},
         {"_id": 0, "search_text": 0}
     ).to_list(100)
 
     instruction_context = await retrieve_instruction_semantic_context(user_id, query, top_k=min(top_k, 8))
-    
-    # Calculate scores for memories
+
+    # Hybrid score memories (semantic 78% + lexical 22%)
     memory_scores = []
     for mem in memories:
-        # Build search text from memory fields
-        search_text = f"{mem.get('title', '')} {mem.get('date', '')} {mem.get('location', '')} {mem.get('description', '')} {' '.join(mem.get('people', []))}"
-        score = keyword_match_score(query, search_text)
-        if score > 0:
-            memory_scores.append((score, mem))
-    
-    # Calculate scores for family
+        search_text = _build_memory_search_text(mem)
+        lexical = keyword_match_score(query, search_text)
+        mem_emb = mem.get("embedding")
+        semantic = cosine_similarity(query_embedding, mem_emb) if query_embedding and mem_emb else 0.0
+        score = (semantic * 0.78 + lexical * 0.22) if (query_embedding and mem_emb) else lexical
+        if score > 0.05:
+            mem_clean = {k: v for k, v in mem.items() if k != "embedding"}
+            memory_scores.append((score, mem_clean))
+
+    # Hybrid score family
     family_scores = []
     for fam in family:
-        # Build search text from family fields
-        search_text = f"{fam.get('name', '')} {fam.get('relationship', '')} {fam.get('relationship_label', '')} {fam.get('notes', '')} {fam.get('category', '')}"
-        score = keyword_match_score(query, search_text)
-        if score > 0:
-            family_scores.append((score, fam))
+        search_text = _build_family_search_text(fam)
+        lexical = keyword_match_score(query, search_text)
+        fam_emb = fam.get("embedding")
+        semantic = cosine_similarity(query_embedding, fam_emb) if query_embedding and fam_emb else 0.0
+        score = (semantic * 0.78 + lexical * 0.22) if (query_embedding and fam_emb) else lexical
+        if score > 0.05:
+            fam_clean = {k: v for k, v in fam.items() if k != "embedding"}
+            family_scores.append((score, fam_clean))
 
-    # Sort and get top results
     memory_scores.sort(key=lambda x: x[0], reverse=True)
     family_scores.sort(key=lambda x: x[0], reverse=True)
-    
+
     top_memories = [m[1] for m in memory_scores[:top_k]]
     top_family = [f[1] for f in family_scores[:top_k]]
     top_instructions = instruction_context.get("instructions", [])[:top_k]
-    
+
     return {
         "memories": top_memories,
         "family": top_family,
@@ -4792,8 +7288,39 @@ async def search_similar_content(user_id: str, query: str, top_k: int = 10) -> d
         "citations": instruction_context.get("citations", [])
     }
 
+@api_router.post("/admin/backfill-embeddings")
+async def backfill_embeddings(current_user: User = Depends(get_current_user)):
+    """Backfill embeddings for memories and family members that don't have them."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    memories = await db.memories.find({"embedding": None}, {"_id": 0}).to_list(2000)
+    mem_count = 0
+    for i in range(0, len(memories), 20):
+        batch = memories[i:i+20]
+        texts = [_build_memory_search_text(m) for m in batch]
+        embeddings = await generate_embeddings(texts)
+        if embeddings:
+            for doc, emb in zip(batch, embeddings):
+                if emb:
+                    await db.memories.update_one({"id": doc["id"]}, {"$set": {"embedding": emb}})
+                    mem_count += 1
+    family = await db.family_members.find({"embedding": None}, {"_id": 0}).to_list(2000)
+    fam_count = 0
+    for i in range(0, len(family), 20):
+        batch = family[i:i+20]
+        texts = [_build_family_search_text(f) for f in batch]
+        embeddings = await generate_embeddings(texts)
+        if embeddings:
+            for doc, emb in zip(batch, embeddings):
+                if emb:
+                    await db.family_members.update_one({"id": doc["id"]}, {"$set": {"embedding": emb}})
+                    fam_count += 1
+    return {"memories_updated": mem_count, "family_updated": fam_count}
+
 @api_router.post("/chat")
+@rate_limit("60/minute")
 async def chat_with_assistant(
+    request: Request,
     chat_request: ChatRequest,
     current_user: User = Depends(get_current_user)
 ):
@@ -4955,8 +7482,24 @@ async def text_to_speech(
         logger.error(f"TTS error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate speech")
 
+@api_router.post("/voice/transcribe")
+async def voice_transcribe(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Transcribe audio file using Whisper (iOS Safari fallback for Web Speech API)."""
+    audio_bytes = await file.read()
+    if len(audio_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file too large (max 10MB)")
+    text = await transcribe_audio_bytes(audio_bytes, filename=file.filename or "audio.webm")
+    if not text:
+        raise HTTPException(status_code=422, detail="Could not transcribe audio")
+    return {"text": text}
+
 @api_router.post("/voice-command")
+@rate_limit("60/minute")
 async def process_voice_command(
+    request: Request,
     command: VoiceCommand,
     current_user: User = Depends(get_current_user)
 ):
@@ -4991,10 +7534,11 @@ async def process_voice_command(
         }
 
     chess_query = "chess" in text and any(term in text for term in ["play", "game", "quiz", "practice"])
+    medication_taken_report = is_medication_taken_report(text)
     medication_schedule_query = is_medication_schedule_question(text)
     instruction_today_query = is_today_instruction_question(text)
     special_intent = "none"
-    if not chess_query and not medication_schedule_query and not instruction_today_query:
+    if not chess_query and not medication_taken_report and not medication_schedule_query and not instruction_today_query:
         special_intent = await classify_special_voice_intent(command.text)
 
     if chess_query or special_intent == "unsupported_chess":
@@ -5025,6 +7569,28 @@ async def process_voice_command(
             "action": "speak",
             "response": response
         }
+
+    # Medication taken report (voice intake logging)
+    if medication_taken_report or special_intent == "medication_taken":
+        try:
+            return await handle_voice_medication_intake(current_user.user_id, command.text)
+        except Exception as e:
+            logger.error(f"Voice medication intake error: {e}")
+            return {
+                "action": "speak",
+                "response": "I had trouble recording your medication. Please try again or use the medication tracker to mark it as taken."
+            }
+
+    # Mood report (voice mood logging)
+    if special_intent == "mood_report":
+        try:
+            return await handle_voice_mood_report(current_user.user_id, command.text)
+        except Exception as e:
+            logger.error(f"Voice mood report error: {e}")
+            return {
+                "action": "speak",
+                "response": "I had trouble recording your mood. Please try again later or use the mood tracker."
+            }
 
     # Check for generic game/play/quiz intent first
     game_words = ["game", "play", "quiz", "practice", "exercise", "brain"]
@@ -5148,22 +7714,370 @@ Guidelines:
         "response": response
     }
 
+# ==================== EXTERNAL BOT WEBHOOKS ====================
+
+@api_router.post("/webhooks/telegram/bot", response_model=dict)
+@rate_limit("30/minute")
+async def telegram_bot_webhook(request: Request):
+    expected_secret = os.environ.get("TELEGRAM_BOT_WEBHOOK_SECRET", "").strip()
+    if expected_secret:
+        provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if provided_secret != expected_secret:
+            raise HTTPException(status_code=401, detail="Invalid Telegram webhook secret")
+
+    update = await request.json()
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return {"ok": True, "ignored": "no_message"}
+
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    if not chat_id:
+        return {"ok": True, "ignored": "no_chat_id"}
+
+    display_name = " ".join(
+        [p for p in [chat.get("first_name"), chat.get("last_name")] if p]
+    ) or chat.get("username") or "Telegram User"
+
+    incoming_text = (message.get("text") or message.get("caption") or "").strip()
+    prefer_voice = False
+
+    if not incoming_text:
+        voice_obj = message.get("voice") or message.get("audio")
+        file_id = (voice_obj or {}).get("file_id") if isinstance(voice_obj, dict) else None
+        if file_id:
+            audio_bytes, filename = await download_telegram_voice_file(file_id)
+            transcript = await transcribe_audio_bytes(audio_bytes, filename or "telegram_audio.ogg") if audio_bytes else None
+            if transcript:
+                incoming_text = transcript
+                prefer_voice = True
+
+    if not incoming_text:
+        response_text = "I could not parse that message. Please send text or a clear voice note."
+        await send_telegram_text_message(chat_id, response_text)
+        await log_external_bot_message("telegram", chat_id, None, None, None, response_text, "parse_error", "error")
+        return {"ok": True, "status": "parse_error"}
+
+    result = await handle_external_doctor_message(
+        channel="telegram",
+        peer_id=chat_id,
+        peer_display_name=display_name,
+        text=incoming_text,
+        prefer_voice=prefer_voice
+    )
+    text_send = await send_telegram_text_message(chat_id, result.get("text", ""))
+    voice_send = None
+    if prefer_voice and result.get("voice_text"):
+        voice_send = await send_telegram_voice_message(chat_id, result["voice_text"])
+    return {
+        "ok": True,
+        "status": result.get("status"),
+        "intent": result.get("intent"),
+        "text_send": text_send,
+        "voice_send": voice_send
+    }
+
+@api_router.post("/webhooks/whatsapp/bot")
+@rate_limit("30/minute")
+async def whatsapp_bot_webhook(request: Request):
+    form = await request.form()
+    form_data = {k: str(v) for k, v in form.items()}
+    provided_signature = request.headers.get("X-Twilio-Signature", "")
+    twilio_auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    # Use a configurable public URL for signature validation.  Behind a
+    # reverse proxy the request.url seen by the app often differs from the
+    # URL Twilio actually signed (the public-facing one).
+    twilio_public_url = os.environ.get("TWILIO_WEBHOOK_PUBLIC_URL", "").strip()
+    sig_url = twilio_public_url or str(request.url)
+    if not verify_twilio_signature(twilio_auth_token, sig_url, form_data, provided_signature):
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+
+    from_peer = normalize_external_peer_id("whatsapp", form_data.get("From", ""))
+    display_name = form_data.get("ProfileName", "WhatsApp User")
+    incoming_text = (form_data.get("Body") or "").strip()
+
+    if not incoming_text:
+        try:
+            num_media = int(form_data.get("NumMedia", "0") or 0)
+        except Exception:
+            num_media = 0
+        if num_media > 0:
+            media_url = form_data.get("MediaUrl0", "")
+            media_type = (form_data.get("MediaContentType0") or "").lower()
+            if media_url and ("audio" in media_type or "ogg" in media_type):
+                audio_bytes, _ctype = await download_twilio_media(media_url)
+                transcript = await transcribe_audio_bytes(audio_bytes, "whatsapp_audio.ogg") if audio_bytes else None
+                if transcript:
+                    incoming_text = transcript
+
+    if not incoming_text:
+        reply_text = "I could not parse that message. Please send text or a clear voice note."
+        await log_external_bot_message("whatsapp", from_peer, None, None, None, reply_text, "parse_error", "error")
+        xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{xml_escape(reply_text)}</Message></Response>'
+        return Response(content=xml, media_type="application/xml")
+
+    result = await handle_external_doctor_message(
+        channel="whatsapp",
+        peer_id=from_peer,
+        peer_display_name=display_name,
+        text=incoming_text,
+        prefer_voice=False
+    )
+    reply_text = result.get("text", "Request processed.")
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{xml_escape(reply_text)}</Message></Response>'
+    return Response(content=xml, media_type="application/xml")
+
+# ==================== PUSH NOTIFICATIONS + MEDICATION SCHEDULER ====================
+
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIMS = {"sub": f"mailto:{os.environ.get('VAPID_CONTACT_EMAIL', 'admin@alzahelp.com')}"}
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER", "")
+
+async def send_push_to_user(user_id: str, title: str, body: str, url: str = "/dashboard"):
+    """Send web push notification to all subscriptions for a user."""
+    if not VAPID_PRIVATE_KEY:
+        return
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return
+    subs = await db.push_subscriptions.find({"user_id": user_id}).to_list(20)
+    payload = json.dumps({"title": title, "body": body, "url": url})
+    for sub in subs:
+        try:
+            webpush(
+                subscription_info={"endpoint": sub["endpoint"], "keys": sub["keys"]},
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims=VAPID_CLAIMS
+            )
+        except Exception as e:
+            # Clean up stale subscriptions (gone/not found)
+            if hasattr(e, 'response') and getattr(e.response, 'status_code', 0) in (404, 410):
+                await db.push_subscriptions.delete_one({"id": sub.get("id")})
+            else:
+                logger.error("Push send failed: %s", e)
+
+async def notify_patient_update(patient_user_id: str, update_type: str, detail: str):
+    """Send push notification to a patient when their care data is updated."""
+    titles = {
+        "medication_added": "New Medication Added",
+        "medication_updated": "Medication Updated",
+        "instruction_added": "New Care Instruction",
+    }
+    try:
+        await send_push_to_user(patient_user_id, titles.get(update_type, "Care Update"), detail, "/dashboard")
+    except Exception:
+        pass
+
+
+async def send_sms_fallback(phone: str, message: str):
+    """Send SMS via Twilio as fallback notification."""
+    twilio_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not all([TWILIO_SID, twilio_token, TWILIO_FROM, phone]):
+        return
+    try:
+        from twilio.rest import Client as TwilioClient
+        tc = TwilioClient(TWILIO_SID, twilio_token)
+        tc.messages.create(body=message, from_=TWILIO_FROM, to=phone)
+    except Exception as e:
+        logger.error("SMS send failed: %s", e)
+
+@api_router.post("/push/subscribe")
+async def subscribe_push(request: Request, current_user: User = Depends(get_current_user)):
+    body = await request.json()
+    sub_doc = {
+        "id": f"push_{uuid.uuid4().hex[:12]}",
+        "user_id": current_user.user_id,
+        "endpoint": body["endpoint"],
+        "keys": body.get("keys", {}),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.push_subscriptions.update_one(
+        {"user_id": current_user.user_id, "endpoint": body["endpoint"]},
+        {"$set": sub_doc},
+        upsert=True
+    )
+    return {"status": "subscribed"}
+
+@api_router.delete("/push/unsubscribe")
+async def unsubscribe_push(request: Request, current_user: User = Depends(get_current_user)):
+    body = await request.json()
+    await db.push_subscriptions.delete_one({"user_id": current_user.user_id, "endpoint": body.get("endpoint", "")})
+    return {"status": "unsubscribed"}
+
+async def check_medication_reminders():
+    """Check for medications due in ~15 minutes and send push notifications."""
+    try:
+        now = datetime.now(timezone.utc)
+        target_time = (now + timedelta(minutes=15)).strftime("%H:%M")
+        medications = await db.medications.find({"active": True}).to_list(1000)
+        for med in medications:
+            scheduled_times = med.get("scheduled_times", [])
+            if target_time in scheduled_times:
+                user_id = med["user_id"]
+                await send_push_to_user(
+                    user_id,
+                    f"Medication Reminder: {med['name']}",
+                    f"Take {med.get('dosage', '')} {med['name']} in 15 minutes",
+                    "/dashboard"
+                )
+        # Check for overdue doses (30min+) and send SMS fallback
+        overdue_time = (now - timedelta(minutes=30)).strftime("%H:%M")
+        for med in medications:
+            if overdue_time in med.get("scheduled_times", []):
+                user_id = med["user_id"]
+                # Check if dose was already taken today
+                today_str = now.strftime("%Y-%m-%d")
+                intake = await db.medication_intake_logs.find_one({
+                    "medication_id": med["id"],
+                    "taken_at": {"$regex": f"^{today_str}"}
+                })
+                if not intake:
+                    user_doc = await db.users.find_one({"user_id": user_id})
+                    if user_doc and _is_premium(user_doc):
+                        contacts = await db.safety_emergency_contacts.find({"user_id": user_id, "receive_sms": True}).to_list(5)
+                        msg = f"AlzaHelp: {user_doc.get('name', 'Patient')} has a missed dose of {med['name']} ({med.get('dosage', '')})"
+                        for contact in contacts:
+                            if contact.get("phone"):
+                                await send_sms_fallback(contact["phone"], msg)
+    except Exception as e:
+        logger.error("Medication reminder check failed: %s", e)
+
+async def ensure_indexes():
+    """Create MongoDB indexes for query performance."""
+    # Users
+    await db.users.create_index("user_id", unique=True)
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("role")
+
+    # Medications
+    await db.medications.create_index([("user_id", 1), ("active", 1)])
+    await db.medications.create_index("id", unique=True)
+
+    # Care instructions
+    await db.care_instructions.create_index([("user_id", 1), ("active", 1), ("policy_type", 1)])
+    await db.care_instructions.create_index("id", unique=True)
+    await db.care_instructions.create_index([("user_id", 1), ("regimen_key", 1), ("version", -1)])
+
+    # Care links
+    await db.care_links.create_index([("caregiver_id", 1), ("status", 1)])
+    await db.care_links.create_index([("patient_id", 1), ("status", 1)])
+    await db.care_links.create_index("id", unique=True)
+
+    # Care invites
+    await db.care_invites.create_index("code", unique=True)
+    await db.care_invites.create_index([("status", 1), ("expires_at", 1)])
+
+    # Families
+    await db.families.create_index([("user_id", 1)])
+    await db.families.create_index("id", unique=True)
+
+    # Memories
+    await db.memories.create_index([("user_id", 1), ("date", -1)])
+    await db.memories.create_index("id", unique=True)
+
+    # Reminders
+    await db.reminders.create_index([("user_id", 1), ("active", 1)])
+    await db.reminders.create_index("id", unique=True)
+
+    # Safety zones
+    await db.safety_zones.create_index([("user_id", 1), ("active", 1)])
+
+    # Chat history
+    await db.chat_history.create_index([("user_id", 1), ("created_at", -1)])
+
+    # Push subscriptions
+    await db.push_subscriptions.create_index("user_id")
+
+    # Audit logs
+    await db.audit_logs.create_index([("user_id", 1), ("created_at", -1)])
+
+    # Sessions - TTL index to auto-expire
+    await db.user_sessions.create_index("user_id")
+    await db.user_sessions.create_index("created_at", expireAfterSeconds=86400 * 30)
+
+    # External bot links
+    await db.external_bot_links.create_index([("doctor_user_id", 1), ("status", 1)])
+    await db.external_bot_links.create_index("link_code", unique=True, sparse=True)
+
+    # Medication intake logs
+    await db.medication_intake_logs.create_index([("user_id", 1), ("medication_id", 1), ("taken_at", -1)])
+
+    # BPSD observations
+    await db.bpsd_observations.create_index([("patient_user_id", 1), ("observed_at", -1)])
+
+    # Mood check-ins
+    await db.mood_checkins.create_index([("user_id", 1), ("created_at", -1)])
+
+    # Instruction chunks (for RAG)
+    await db.instruction_chunks.create_index([("user_id", 1), ("instruction_id", 1)])
+
+    logger.info("MongoDB indexes ensured")
+
+
+@app.on_event("startup")
+async def setup_db_indexes():
+    await ensure_indexes()
+
+
+# Start scheduler on app startup
+@app.on_event("startup")
+async def start_medication_scheduler():
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(check_medication_reminders, 'interval', minutes=1)
+        scheduler.start()
+        logger.info("Medication reminder scheduler started")
+    except ImportError:
+        logger.warning("APScheduler not installed — medication reminders disabled")
+
 # ==================== LEGACY ROUTES ====================
 
 @api_router.get("/")
 async def root():
     return {"message": "MemoryKeeper API"}
 
+# Health check endpoint (outside /api prefix for load balancers)
+@app.get("/health")
+async def health_check():
+    try:
+        await db.command("ping")
+        return {"status": "ok", "db": "connected"}
+    except Exception:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"status": "degraded", "db": "disconnected"})
+
 # Include the router in the main app
 app.include_router(api_router)
 
+_cors_origins = os.environ.get('CORS_ORIGINS', '').strip()
+if not _cors_origins:
+    _cors_origins = "http://localhost:3000"
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in _cors_origins.split(',') if o.strip()],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=(self)"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://us-assets.i.posthog.com https://assets.emergent.sh; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://us.i.posthog.com; font-src 'self'; frame-ancestors 'none'"
+    return response
+
+@app.on_event("startup")
+async def startup_seed():
+    await _seed_demo_account()
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

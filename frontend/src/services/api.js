@@ -1,7 +1,7 @@
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 
-// Helper for fetch with credentials
-const fetchWithAuth = async (url, options = {}) => {
+// Helper for fetch with credentials and auto-refresh on 401
+const fetchWithAuth = async (url, options = {}, _retried = false) => {
   const response = await fetch(`${BACKEND_URL}${url}`, {
     ...options,
     credentials: 'include',
@@ -10,12 +10,22 @@ const fetchWithAuth = async (url, options = {}) => {
       ...options.headers,
     },
   });
-  
+
+  if (response.status === 401 && !_retried) {
+    const refreshRes = await fetch(`${BACKEND_URL}/api/auth/refresh`, {
+      method: 'POST',
+      credentials: 'include',
+    });
+    if (refreshRes.ok) return fetchWithAuth(url, options, true);
+    window.location.href = '/login';
+    throw new Error('Session expired');
+  }
+
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: 'Request failed' }));
     throw new Error(error.detail || 'Request failed');
   }
-  
+
   return response.json();
 };
 
@@ -399,6 +409,32 @@ export const caregiverApi = {
   }),
 };
 
+// External doctor bot API (Telegram/WhatsApp link + query)
+export const externalBotApi = {
+  getPatients: () => fetchWithAuth('/api/external-bot/patients'),
+
+  createLinkCode: (data) => fetchWithAuth('/api/external-bot/link-codes', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+
+  getLinks: () => fetchWithAuth('/api/external-bot/links'),
+
+  updateLinkPatient: (linkId, patientUserId = null) => fetchWithAuth(`/api/external-bot/links/${encodeURIComponent(linkId)}/patient`, {
+    method: 'PUT',
+    body: JSON.stringify({ patient_user_id: patientUserId }),
+  }),
+
+  revokeLink: (linkId) => fetchWithAuth(`/api/external-bot/links/${encodeURIComponent(linkId)}`, {
+    method: 'DELETE',
+  }),
+
+  query: (data) => fetchWithAuth('/api/external-bot/query', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+};
+
 // Admin governance API
 export const adminApi = {
   getPendingClinicians: () => fetchWithAuth('/api/admin/clinicians/pending'),
@@ -588,6 +624,47 @@ export const uploadApi = {
   },
 };
 
+// Account management API (GDPR)
+export const accountApi = {
+  exportData: () => fetchWithAuth('/api/auth/export'),
+  deleteAccount: () => fetchWithAuth('/api/auth/account', { method: 'DELETE' }),
+};
+
+// Push notification subscription API
+export const pushApi = {
+  subscribe: (subscription) => fetchWithAuth('/api/push/subscribe', {
+    method: 'POST',
+    body: JSON.stringify(subscription),
+  }),
+  unsubscribe: (endpoint) => fetchWithAuth('/api/push/unsubscribe', {
+    method: 'DELETE',
+    body: JSON.stringify({ endpoint }),
+  }),
+};
+
+// Billing / subscription API
+export const billingApi = {
+  getStatus: () => fetchWithAuth('/api/billing/status'),
+  createCheckout: () => fetchWithAuth('/api/billing/create-checkout', { method: 'POST' }),
+  createPortal: () => fetchWithAuth('/api/billing/create-portal', { method: 'POST' }),
+};
+
+export const authApi = {
+  startDemo: () => fetchWithAuth('/api/auth/demo', { method: 'POST' }),
+};
+
+export const referralApi = {
+  generate: () => fetchWithAuth('/api/referral/generate', { method: 'POST' }),
+  stats: () => fetchWithAuth('/api/referral/stats'),
+};
+
+export const careReportApi = {
+  getDailyDigest: (patientId) => fetchWithAuth(`/api/care/patients/${patientId}/daily-digest`),
+  downloadReport: (patientId, days = 30) =>
+    fetch(`${BACKEND_URL}/api/care/patients/${patientId}/report?days=${days}`, { credentials: 'include' })
+      .then(r => r.blob()),
+};
+
 export default {
   familyApi,
   memoriesApi,
@@ -598,8 +675,15 @@ export default {
   medicationsApi,
   moodApi,
   caregiverApi,
+  externalBotApi,
   adminApi,
   careInstructionsApi,
   chatApi,
   uploadApi,
+  accountApi,
+  pushApi,
+  billingApi,
+  authApi,
+  referralApi,
+  careReportApi,
 };

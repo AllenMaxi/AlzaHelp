@@ -1,17 +1,20 @@
 import React from 'react';
-import { Heart, Sun, Moon, Home, Menu, LogOut, User } from 'lucide-react';
+import { Heart, Sun, Moon, Home, Menu, LogOut, User, Globe } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger, SheetTitle } from '@/components/ui/sheet';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/context/AuthContext';
+import { PushNotificationManager } from '@/components/PushNotificationManager';
+import { useTranslation } from 'react-i18next';
 
 export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode, user }) => {
   const { logout } = useAuth();
-  
+  const { t, i18n } = useTranslation();
+
   const navItems = [
-    { id: 'home', label: 'Home', icon: Home },
-    { id: 'memories', label: 'My Memories', icon: Heart },
+    { id: 'home', label: t('nav.home'), icon: Home },
+    { id: 'memories', label: t('nav.memories'), icon: Heart },
   ];
 
   const handleLogout = async () => {
@@ -62,8 +65,24 @@ export const Header = ({ currentView, setCurrentView, darkMode, setDarkMode, use
             })}
           </nav>
 
-          {/* Right side - User menu, Theme toggle and mobile menu */}
+          {/* Right side - Notifications, Theme toggle and mobile menu */}
           <div className="flex items-center gap-3">
+            <PushNotificationManager />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon" className="h-12 w-12" aria-label="Change language">
+                  <Globe className="h-6 w-6" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => i18n.changeLanguage('en')} className="cursor-pointer">
+                  {t('language.en')} {i18n.language?.startsWith('en') ? '✓' : ''}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => i18n.changeLanguage('es')} className="cursor-pointer">
+                  {t('language.es')} {i18n.language?.startsWith('es') ? '✓' : ''}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Button
               variant="outline"
               size="icon"

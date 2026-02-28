@@ -1,0 +1,101 @@
+{
+  "landing": {
+    "badge": "Caring technology for memory challenges",
+    "title": "Remember what",
+    "titleHighlight": "matters most",
+    "subtitle": "AlzaHelp helps people with Alzheimer's and memory challenges stay connected to their loved ones, medications, and daily routines through voice AI and smart reminders.",
+    "getStarted": "Get Started",
+    "tryDemo": "Try Demo — No Signup",
+    "learnMore": "Learn More",
+    "features": {
+      "voice": { "title": "Voice Companion", "desc": "Say \"Hey Memory\" to get medication reminders, hear your daily schedule, or simply have a conversation." },
+      "medication": { "title": "Medication Tracking", "desc": "Never miss a dose with smart reminders, voice-powered intake logging, and real-time caregiver alerts." },
+      "family": { "title": "Family Connections", "desc": "Keep photos, stories, and contact info for loved ones always at your fingertips. Ask the AI who anyone is." },
+      "safety": { "title": "Safety Net", "desc": "Geofencing, SOS alerts, and fall detection keep caregivers informed and patients safe." }
+    },
+    "roles": {
+      "patients": { "title": "For Patients", "desc": "Talk to your AI companion, play memory games, and stay connected to your daily routine and loved ones." },
+      "caregivers": { "title": "For Doctors & Caregivers", "desc": "Manage medications and care instructions from the portal or via Telegram/WhatsApp chatbot." },
+      "ai": { "title": "AI-Powered", "desc": "Semantic search understands context. Ask about memories naturally and get intelligent, caring responses." }
+    },
+    "pricing": {
+      "title": "Simple, transparent pricing",
+      "free": { "name": "Free", "price": "$0", "period": "forever", "features": ["All patient features", "Voice AI companion", "Medication tracking", "Memory games", "Up to 3 linked caregivers"] },
+      "premium": { "name": "Premium", "price": "$9.99", "period": "/month", "features": ["Everything in Free", "Telegram/WhatsApp bot", "SMS medication alerts", "Remote monitoring", "Up to 20 linked caregivers", "Priority support"] }
+    },
+    "cta": "Start preserving memories today",
+    "ctaButton": "Create Free Account"
+  },
+  "nav": {
+    "home": "Home",
+    "memories": "My Memories",
+    "logout": "Logout",
+    "profile": "Profile"
+  },
+  "dashboard": {
+    "welcome": "Welcome back",
+    "demoBanner": "You're exploring AlzaHelp in demo mode.",
+    "demoSignup": "Sign up free to save your own data.",
+    "tabs": {
+      "companion": "AI Companion",
+      "family": "Family",
+      "timeline": "Timeline",
+      "games": "Games",
+      "reminders": "Reminders",
+      "medications": "Medications",
+      "mood": "Mood & Behavior",
+      "navigation": "Navigation",
+      "assistant": "Chat",
+      "caregiver": "Caregiver Portal",
+      "admin": "Admin"
+    }
+  },
+  "onboarding": {
+    "title": "Welcome to AlzaHelp!",
+    "subtitle": "Let's set up a couple of things. This takes about 1 minute.",
+    "step1": "Welcome",
+    "step2": "Add a Photo",
+    "step3": "Add Medication",
+    "step4": "Add Family",
+    "step5": "Install App",
+    "skip": "Skip",
+    "skipAll": "Skip Setup",
+    "next": "Next",
+    "finish": "Finish Setup",
+    "photoPrompt": "Upload a photo of yourself or your family",
+    "medName": "Medication Name",
+    "medDosage": "Dosage",
+    "familyName": "Family Member Name",
+    "familyRelation": "Relationship",
+    "installTitle": "Install AlzaHelp",
+    "installDesc": "Add AlzaHelp to your home screen for quick access",
+    "installButton": "Install App"
+  },
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "edit": "Edit",
+    "add": "Add",
+    "search": "Search",
+    "loading": "Loading...",
+    "error": "Something went wrong",
+    "success": "Success",
+    "confirm": "Confirm",
+    "back": "Back",
+    "signUp": "Sign Up",
+    "login": "Log In"
+  },
+  "language": {
+    "en": "English",
+    "es": "Español"
+  },
+  "referral": {
+    "title": "Invite Your Family",
+    "description": "Share AlzaHelp with family members who care for your loved one",
+    "shareButton": "Share Invite Link",
+    "copied": "Link copied to clipboard!",
+    "shareText": "I use AlzaHelp to help care for my loved one. Join me: {{url}}",
+    "count": "{{count}} people joined through your link"
+  }
+}

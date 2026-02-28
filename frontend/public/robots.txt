@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Sitemap: https://alzahelp.app/sitemap.xml
+
+Disallow: /dashboard
+Disallow: /api/

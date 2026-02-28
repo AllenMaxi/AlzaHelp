@@ -1,0 +1,101 @@
+{
+  "landing": {
+    "badge": "Tecnología de cuidado para desafíos de memoria",
+    "title": "Recuerda lo que",
+    "titleHighlight": "más importa",
+    "subtitle": "AlzaHelp ayuda a personas con Alzheimer y desafíos de memoria a mantenerse conectados con sus seres queridos, medicamentos y rutinas diarias mediante IA de voz y recordatorios inteligentes.",
+    "getStarted": "Comenzar",
+    "tryDemo": "Probar Demo — Sin Registro",
+    "learnMore": "Saber Más",
+    "features": {
+      "voice": { "title": "Compañero de Voz", "desc": "Di \"Hey Memory\" para recibir recordatorios de medicamentos, escuchar tu horario diario o simplemente conversar." },
+      "medication": { "title": "Control de Medicamentos", "desc": "Nunca pierdas una dosis con recordatorios inteligentes, registro por voz y alertas en tiempo real para cuidadores." },
+      "family": { "title": "Conexiones Familiares", "desc": "Mantén fotos, historias e información de contacto de tus seres queridos siempre a tu alcance." },
+      "safety": { "title": "Red de Seguridad", "desc": "Geovallas, alertas SOS y detección de caídas mantienen informados a los cuidadores y seguros a los pacientes." }
+    },
+    "roles": {
+      "patients": { "title": "Para Pacientes", "desc": "Habla con tu compañero IA, juega juegos de memoria y mantente conectado con tu rutina diaria y seres queridos." },
+      "caregivers": { "title": "Para Doctores y Cuidadores", "desc": "Gestiona medicamentos e instrucciones de cuidado desde el portal o por chatbot de Telegram/WhatsApp." },
+      "ai": { "title": "Potenciado por IA", "desc": "La búsqueda semántica entiende el contexto. Pregunta sobre recuerdos naturalmente y obtén respuestas inteligentes." }
+    },
+    "pricing": {
+      "title": "Precios simples y transparentes",
+      "free": { "name": "Gratis", "price": "$0", "period": "para siempre", "features": ["Todas las funciones del paciente", "Compañero de voz IA", "Control de medicamentos", "Juegos de memoria", "Hasta 3 cuidadores vinculados"] },
+      "premium": { "name": "Premium", "price": "$9.99", "period": "/mes", "features": ["Todo lo de Gratis", "Bot de Telegram/WhatsApp", "Alertas SMS de medicamentos", "Monitoreo remoto", "Hasta 20 cuidadores vinculados", "Soporte prioritario"] }
+    },
+    "cta": "Comienza a preservar recuerdos hoy",
+    "ctaButton": "Crear Cuenta Gratis"
+  },
+  "nav": {
+    "home": "Inicio",
+    "memories": "Mis Recuerdos",
+    "logout": "Cerrar Sesión",
+    "profile": "Perfil"
+  },
+  "dashboard": {
+    "welcome": "Bienvenido de nuevo",
+    "demoBanner": "Estás explorando AlzaHelp en modo demo.",
+    "demoSignup": "Regístrate gratis para guardar tus propios datos.",
+    "tabs": {
+      "companion": "Compañero IA",
+      "family": "Familia",
+      "timeline": "Línea de Tiempo",
+      "games": "Juegos",
+      "reminders": "Recordatorios",
+      "medications": "Medicamentos",
+      "mood": "Ánimo y Conducta",
+      "navigation": "Navegación",
+      "assistant": "Chat",
+      "caregiver": "Portal de Cuidador",
+      "admin": "Administración"
+    }
+  },
+  "onboarding": {
+    "title": "¡Bienvenido a AlzaHelp!",
+    "subtitle": "Configuremos un par de cosas. Esto toma aproximadamente 1 minuto.",
+    "step1": "Bienvenida",
+    "step2": "Añadir Foto",
+    "step3": "Añadir Medicamento",
+    "step4": "Añadir Familiar",
+    "step5": "Instalar App",
+    "skip": "Omitir",
+    "skipAll": "Omitir Configuración",
+    "next": "Siguiente",
+    "finish": "Finalizar",
+    "photoPrompt": "Sube una foto tuya o de tu familia",
+    "medName": "Nombre del Medicamento",
+    "medDosage": "Dosis",
+    "familyName": "Nombre del Familiar",
+    "familyRelation": "Relación",
+    "installTitle": "Instalar AlzaHelp",
+    "installDesc": "Agrega AlzaHelp a tu pantalla de inicio para acceso rápido",
+    "installButton": "Instalar App"
+  },
+  "common": {
+    "save": "Guardar",
+    "cancel": "Cancelar",
+    "delete": "Eliminar",
+    "edit": "Editar",
+    "add": "Añadir",
+    "search": "Buscar",
+    "loading": "Cargando...",
+    "error": "Algo salió mal",
+    "success": "Éxito",
+    "confirm": "Confirmar",
+    "back": "Volver",
+    "signUp": "Registrarse",
+    "login": "Iniciar Sesión"
+  },
+  "language": {
+    "en": "English",
+    "es": "Español"
+  },
+  "referral": {
+    "title": "Invita a Tu Familia",
+    "description": "Comparte AlzaHelp con familiares que cuidan a tu ser querido",
+    "shareButton": "Compartir Enlace",
+    "copied": "¡Enlace copiado!",
+    "shareText": "Uso AlzaHelp para cuidar a mi ser querido. Únete: {{url}}",
+    "count": "{{count}} personas se unieron con tu enlace"
+  }
+}
