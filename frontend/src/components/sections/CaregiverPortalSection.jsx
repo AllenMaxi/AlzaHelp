@@ -15,7 +15,10 @@ import {
   Plus,
   Power,
   Edit3,
-  Crown
+  Crown,
+  Calendar,
+  Download,
+  Sparkles
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,7 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { careInstructionsApi, caregiverApi, externalBotApi, medicationsApi, uploadApi, billingApi, referralApi } from "@/services/api";
+import { careInstructionsApi, caregiverApi, externalBotApi, medicationsApi, uploadApi, billingApi, referralApi, careReportApi } from "@/services/api";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 
@@ -1657,6 +1660,83 @@ export const CaregiverPortalSection = ({ user, onNavigate, subscriptionTier = "f
             <Button variant="outline" onClick={() => onNavigate?.("medications")}>
               Open Medication Tracker
             </Button>
+          </div>
+        )}
+
+        {/* Daily Digest & PDF Report — only show when a patient is selected */}
+        {selectedPatientId && (
+          <div className="mt-8 grid gap-4 sm:grid-cols-2">
+            {/* Daily Digest */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Sparkles className="h-5 w-5 text-amber-500" />
+                  {t('caregiver.digestTitle')}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-muted-foreground mb-4">{t('caregiver.digestDesc')}</p>
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={async () => {
+                    try {
+                      toast.info(t('common.loading'));
+                      const data = await careReportApi.getDailyDigest(selectedPatientId);
+                      toast.dismiss();
+                      toast.success(data.summary, { duration: 15000, description: `${data.adherence} | ${data.mood || ''} | ${data.alerts || t('caregiver.noAlerts')}` });
+                    } catch (err) {
+                      toast.dismiss();
+                      if (err.message?.includes('429')) {
+                        toast.error(t('caregiver.aiLimitReached'));
+                      } else {
+                        toast.error(t('common.error'));
+                      }
+                    }
+                  }}
+                >
+                  <Calendar className="h-4 w-4 mr-2" />
+                  {t('caregiver.viewDigest')}
+                </Button>
+              </CardContent>
+            </Card>
+
+            {/* PDF Care Report */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <FileText className="h-5 w-5 text-blue-500" />
+                  {t('caregiver.reportTitle')}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-muted-foreground mb-4">{t('caregiver.reportDesc')}</p>
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={async () => {
+                    try {
+                      toast.info(t('common.loading'));
+                      const blob = await careReportApi.downloadReport(selectedPatientId, 30);
+                      toast.dismiss();
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `care-report-${selectedPatientId}.pdf`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                      toast.success(t('caregiver.reportDownloaded'));
+                    } catch (err) {
+                      toast.dismiss();
+                      toast.error(t('common.error'));
+                    }
+                  }}
+                >
+                  <Download className="h-4 w-4 mr-2" />
+                  {t('caregiver.downloadReport')}
+                </Button>
+              </CardContent>
+            </Card>
           </div>
         )}
 

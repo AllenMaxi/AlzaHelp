@@ -4,10 +4,12 @@ import { useTranslation } from 'react-i18next';
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Mic, Pill, Users, Shield, Heart, ArrowRight, Brain, MessageCircle, Check, Crown } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
 
 export const LandingPage = () => {
   const navigate = useNavigate();
   const { t, i18n } = useTranslation();
+  const { demoLogin } = useAuth();
 
   const features = [
     {
@@ -108,13 +110,8 @@ export const LandingPage = () => {
             className="text-lg px-8 py-6 border-violet-300 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-900/30"
             onClick={async () => {
               try {
-                const res = await fetch(`${process.env.REACT_APP_BACKEND_URL || ''}/api/auth/demo`, {
-                  method: 'POST',
-                  credentials: 'include',
-                });
-                if (res.ok) {
-                  navigate('/dashboard');
-                }
+                await demoLogin();
+                navigate('/dashboard');
               } catch (err) {
                 console.error('Demo failed:', err);
               }

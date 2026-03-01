@@ -1,5 +1,6 @@
 import React from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
 import {
@@ -8,12 +9,17 @@ import {
   Users,
   Calendar,
   MessageCircle,
-  Shield
+  Shield,
+  Globe
 } from "lucide-react";
 
 export const LoginPage = () => {
   const { login, register, isAuthenticated } = useAuth();
   const navigate = useNavigate();
+  const { t, i18n } = useTranslation();
+  const [searchParams] = useSearchParams();
+  const referralCode = searchParams.get("ref");
+
   const [isLogin, setIsLogin] = React.useState(true);
   const [isLoading, setIsLoading] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -36,10 +42,10 @@ export const LoginPage = () => {
         await login(formData.email, formData.password);
         navigate("/dashboard");
       } else {
-        const registration = await register(formData.email, formData.password, formData.name, formData.role);
+        const registration = await register(formData.email, formData.password, formData.name, formData.role, referralCode);
         if (registration?.requires_approval) {
           setSuccessMessage(
-            registration.message || "Registration submitted. Your account is pending admin approval."
+            registration.message || t('login.pendingApproval')
           );
           setIsLogin(true);
           setFormData({
@@ -54,7 +60,7 @@ export const LoginPage = () => {
         navigate("/dashboard");
       }
     } catch (err) {
-      setError(err.message || "An error occurred. Please try again.");
+      setError(err.message || t('common.error'));
     } finally {
       setIsLoading(false);
     }
@@ -67,26 +73,33 @@ export const LoginPage = () => {
     }
   }, [isAuthenticated, navigate]);
 
+  // If coming from referral link, default to register
+  React.useEffect(() => {
+    if (referralCode) {
+      setIsLogin(false);
+    }
+  }, [referralCode]);
+
   const features = [
     {
       icon: Users,
-      title: "Family Directory",
-      description: "Keep all your loved ones' information in one safe place"
+      title: t('login.features.family'),
+      description: t('login.features.familyDesc')
     },
     {
       icon: Calendar,
-      title: "Memory Timeline",
-      description: "Store and relive your precious memories anytime"
+      title: t('login.features.timeline'),
+      description: t('login.features.timelineDesc')
     },
     {
       icon: MessageCircle,
-      title: "AI Assistant",
-      description: "Ask questions about your family and memories"
+      title: t('login.features.ai'),
+      description: t('login.features.aiDesc')
     },
     {
       icon: Shield,
-      title: "Safe & Private",
-      description: "Your memories are protected and only visible to you"
+      title: t('login.features.privacy'),
+      description: t('login.features.privacyDesc')
     }
   ];
 
@@ -94,7 +107,7 @@ export const LoginPage = () => {
     <div className="min-h-screen bg-gradient-hero">
       {/* Header */}
       <header className="py-6 px-4 sm:px-6 lg:px-8">
-        <div className="container mx-auto flex items-center justify-center sm:justify-start">
+        <div className="container mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary shadow-soft">
               <Heart
@@ -107,9 +120,19 @@ export const LoginPage = () => {
                 MemoryKeeper
               </h1>
               <p className="text-sm text-muted-foreground">
-                Your memories, always close
+                {t('login.tagline')}
               </p>
             </div>
+          </div>
+          {/* Language Switcher */}
+          <div className="relative">
+            <button
+              onClick={() => i18n.changeLanguage(i18n.language === 'en' ? 'es' : 'en')}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border bg-background/80 hover:bg-accent text-sm font-medium transition-colors"
+            >
+              <Globe className="h-4 w-4" />
+              {i18n.language === 'en' ? 'EN' : 'ES'}
+            </button>
           </div>
         </div>
       </header>
@@ -122,14 +145,20 @@ export const LoginPage = () => {
             <div className="bg-card border-2 border-border rounded-3xl p-8 shadow-card">
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-bold text-foreground mb-2">
-                  {isLogin ? "Welcome Back" : "Create Account"}
+                  {isLogin ? t('login.welcomeBack') : t('login.createAccount')}
                 </h2>
                 <p className="text-muted-foreground">
                   {isLogin
-                    ? "Enter your details to access your memories"
-                    : "Start preserving your memories today"}
+                    ? t('login.loginSubtitle')
+                    : t('login.registerSubtitle')}
                 </p>
               </div>
+
+              {referralCode && !isLogin && (
+                <div className="mb-6 p-4 rounded-xl bg-primary/10 text-primary text-sm font-medium">
+                  {t('login.referralInvite')}
+                </div>
+              )}
 
               {error && (
                 <div className="mb-6 p-4 rounded-xl bg-destructive/10 text-destructive text-sm font-medium animate-shake">
@@ -147,12 +176,12 @@ export const LoginPage = () => {
                 {!isLogin && (
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
-                      Full Name
+                      {t('login.fullName')}
                     </label>
                     <input
                       type="text"
                       className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-                      placeholder="e.g. John Doe"
+                      placeholder={t('login.namePlaceholder')}
                       value={formData.name}
                       onChange={(e) =>
                         setFormData({ ...formData, name: e.target.value })
@@ -165,7 +194,7 @@ export const LoginPage = () => {
                 {!isLogin && (
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
-                      Account Role
+                      {t('login.accountRole')}
                     </label>
                     <select
                       className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
@@ -174,22 +203,22 @@ export const LoginPage = () => {
                         setFormData({ ...formData, role: e.target.value })
                       }
                     >
-                      <option value="patient">Patient</option>
-                      <option value="caregiver">Caregiver</option>
-                      <option value="clinician">Clinician</option>
-                      <option value="admin">Admin (Allowlisted)</option>
+                      <option value="patient">{t('login.roles.patient')}</option>
+                      <option value="caregiver">{t('login.roles.caregiver')}</option>
+                      <option value="clinician">{t('login.roles.clinician')}</option>
+                      <option value="admin">{t('login.roles.admin')}</option>
                     </select>
                   </div>
                 )}
 
                 <div>
                   <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
-                    Email Address
+                    {t('login.email')}
                   </label>
                   <input
                     type="email"
                     className="w-full px-4 py-3 rounded-xl border-2 border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-                    placeholder="john@example.com"
+                    placeholder={t('login.emailPlaceholder')}
                     value={formData.email}
                     onChange={(e) =>
                       setFormData({ ...formData, email: e.target.value })
@@ -200,7 +229,7 @@ export const LoginPage = () => {
 
                 <div>
                   <label className="block text-sm font-medium text-foreground mb-1.5 ml-1">
-                    Password
+                    {t('login.password')}
                   </label>
                   <input
                     type="password"
@@ -223,12 +252,12 @@ export const LoginPage = () => {
                 >
                   {isLoading ? (
                     <span className="flex items-center gap-2">
-                      Processing...
+                      {t('login.processing')}
                     </span>
                   ) : (
                     <span className="flex items-center gap-2">
                       <LogIn className="h-5 w-5" />
-                      {isLogin ? "Sign In" : "Create Account"}
+                      {isLogin ? t('common.login') : t('common.signUp')}
                     </span>
                   )}
                 </Button>
@@ -245,8 +274,8 @@ export const LoginPage = () => {
                   className="text-sm font-medium text-primary hover:text-primary/80 transition-colors"
                 >
                   {isLogin
-                    ? "Don't have an account? Sign up"
-                    : "Already have an account? Sign in"}
+                    ? t('login.noAccount')
+                    : t('login.hasAccount')}
                 </button>
               </div>
             </div>
@@ -258,7 +287,7 @@ export const LoginPage = () => {
               const Icon = feature.icon;
               return (
                 <div
-                  key={feature.title}
+                  key={index}
                   className="p-6 rounded-2xl bg-card border-2 border-border shadow-card animate-scale-in"
                   style={{ animationDelay: `${index * 0.1}s` }}
                 >
@@ -281,13 +310,13 @@ export const LoginPage = () => {
         <div className="mt-16 sm:mt-20 relative rounded-3xl overflow-hidden shadow-elevated max-w-4xl mx-auto">
           <img
             src="https://images.unsplash.com/photo-1600779438084-a87b966aab99?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODh8MHwxfHNlYXJjaHwxfHxncmFuZHBhcmVudHMlMjBncmFuZGNoaWxkcmVufGVufDB8fHx8MTc2OTM3NzY3N3ww&ixlib=rb-4.1.0&q=85"
-            alt="Family memories"
+            alt={t('login.heroAlt')}
             className="w-full h-[300px] sm:h-[400px] object-cover"
           />
           <div className="absolute inset-0 bg-gradient-to-t from-background/80 via-transparent to-transparent" />
           <div className="absolute bottom-6 left-6 right-6 text-center">
             <p className="text-xl font-semibold text-foreground">
-              Your precious memories deserve to be remembered
+              {t('login.heroText')}
             </p>
           </div>
         </div>
@@ -303,7 +332,7 @@ export const LoginPage = () => {
             </span>
           </div>
           <p className="text-base text-muted-foreground">
-            Made with love to help you remember what matters most.
+            {t('login.footer')}
           </p>
         </div>
       </footer>

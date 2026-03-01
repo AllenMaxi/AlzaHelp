@@ -2053,6 +2053,54 @@ async def refresh_access_token(request: Request, response: Response):
     return {"message": "Token refreshed"}
 
 
+# ==================== AI USAGE LIMITS ====================
+
+AI_DAILY_LIMITS = {
+    "free": int(os.environ.get("AI_DAILY_LIMIT_FREE", "20")),
+    "premium": int(os.environ.get("AI_DAILY_LIMIT_PREMIUM", "100")),
+}
+AI_DAILY_LIMIT_DEMO = int(os.environ.get("AI_DAILY_LIMIT_DEMO", "10"))
+
+
+async def check_ai_budget(current_user) -> None:
+    """Raise 429 if user has exceeded their daily AI call limit."""
+    user_id = current_user.user_id if hasattr(current_user, 'user_id') else current_user.get('user_id', '')
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{user_id}:{today}"
+
+    # Determine limit
+    if user_id == "demo_patient_001":
+        limit = AI_DAILY_LIMIT_DEMO
+    else:
+        user_doc = await db.users.find_one({"user_id": user_id}, {"subscription_tier": 1})
+        tier = (user_doc or {}).get("subscription_tier", "free")
+        limit = AI_DAILY_LIMITS.get(tier, AI_DAILY_LIMITS["free"])
+
+    # Check current count
+    usage = await db.ai_usage.find_one({"_id": key})
+    count = (usage or {}).get("count", 0)
+
+    if count >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily AI limit reached ({limit} requests). Resets at midnight UTC."
+            + (" Upgrade to Premium for more!" if limit == AI_DAILY_LIMITS["free"] else "")
+        )
+
+
+async def track_ai_usage(current_user) -> None:
+    """Increment the daily AI usage counter for a user."""
+    user_id = current_user.user_id if hasattr(current_user, 'user_id') else current_user.get('user_id', '')
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{user_id}:{today}"
+
+    await db.ai_usage.update_one(
+        {"_id": key},
+        {"$inc": {"count": 1}, "$setOnInsert": {"user_id": user_id, "date": today}},
+        upsert=True,
+    )
+
+
 # ==================== DEMO MODE ====================
 
 DEMO_USER_ID = "demo_patient_001"
@@ -6887,6 +6935,7 @@ async def get_daily_note(
 @api_router.get("/care/patients/{patient_id}/daily-digest")
 async def daily_digest(patient_id: str, current_user: User = Depends(get_current_user)):
     """Generate an AI-powered daily summary for a caregiver."""
+    await check_ai_budget(current_user)
     await resolve_target_user_id(current_user, patient_id)
 
     today = datetime.now(timezone.utc).date().isoformat()
@@ -6938,6 +6987,7 @@ Be warm but factual. If adherence is low, mention it gently."""
     except Exception:
         summary = f"{patient_name}'s day: {adherence} medications taken. {mood_summary}. {alert_summary}."
 
+    await track_ai_usage(current_user)
     return {
         "patient_name": patient_name,
         "date": today,
@@ -7056,6 +7106,26 @@ async def generate_referral(current_user: User = Depends(get_current_user)):
         {"$set": {"referral_code": code}}
     )
     return {"code": code, "referral_count": 0}
+
+
+@api_router.get("/ai/usage")
+async def ai_usage_stats(current_user: User = Depends(get_current_user)):
+    """Get the user's AI usage for today."""
+    user_id = current_user.user_id
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{user_id}:{today}"
+
+    if user_id == DEMO_USER_ID:
+        limit = AI_DAILY_LIMIT_DEMO
+    else:
+        user_doc = await db.users.find_one({"user_id": user_id}, {"subscription_tier": 1})
+        tier = (user_doc or {}).get("subscription_tier", "free")
+        limit = AI_DAILY_LIMITS.get(tier, AI_DAILY_LIMITS["free"])
+
+    usage = await db.ai_usage.find_one({"_id": key})
+    used = (usage or {}).get("count", 0)
+
+    return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
 
 
 @api_router.get("/referral/stats")
@@ -7325,6 +7395,7 @@ async def chat_with_assistant(
     current_user: User = Depends(get_current_user)
 ):
     """Chat with AI assistant using RAG"""
+    await check_ai_budget(current_user)
     client = get_openai_client()
     
     # Search for relevant context
@@ -7432,6 +7503,7 @@ Important guidelines:
     )
     await db.chat_messages.insert_one(assistant_msg.model_dump())
     
+    await track_ai_usage(current_user)
     return {"response": response, "citations": citations}
 
 @api_router.get("/chat/history/{session_id}")
@@ -7488,12 +7560,14 @@ async def voice_transcribe(
     current_user: User = Depends(get_current_user)
 ):
     """Transcribe audio file using Whisper (iOS Safari fallback for Web Speech API)."""
+    await check_ai_budget(current_user)
     audio_bytes = await file.read()
     if len(audio_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Audio file too large (max 10MB)")
     text = await transcribe_audio_bytes(audio_bytes, filename=file.filename or "audio.webm")
     if not text:
         raise HTTPException(status_code=422, detail="Could not transcribe audio")
+    await track_ai_usage(current_user)
     return {"text": text}
 
 @api_router.post("/voice-command")
@@ -7504,6 +7578,7 @@ async def process_voice_command(
     current_user: User = Depends(get_current_user)
 ):
     """Process voice command and return action + response"""
+    await check_ai_budget(current_user)
     text = command.text.lower().strip()
     
     # Define navigation commands
@@ -7709,6 +7784,7 @@ Guidelines:
         logger.error(f"OpenAI voice command error: {e}")
         response = "I'm sorry, I'm having trouble understanding right now. Could you try again?"
     
+    await track_ai_usage(current_user)
     return {
         "action": "speak",
         "response": response
@@ -8013,6 +8089,9 @@ async def ensure_indexes():
 
     # Instruction chunks (for RAG)
     await db.instruction_chunks.create_index([("user_id", 1), ("instruction_id", 1)])
+
+    # AI usage counters - TTL auto-cleanup after 7 days
+    await db.ai_usage.create_index("date", expireAfterSeconds=86400 * 7)
 
     logger.info("MongoDB indexes ensured")
 

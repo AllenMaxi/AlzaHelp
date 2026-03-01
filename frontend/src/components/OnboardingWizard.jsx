@@ -41,9 +41,7 @@ export const OnboardingWizard = ({ onComplete, userName = "Friend" }) => {
     if (!file) return;
     setSaving(true);
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      await uploadApi.upload(formData);
+      await uploadApi.uploadFile(file);
       setPhotoUploaded(true);
       toast.success(t('common.success'));
       setTimeout(() => setStep(2), 500);

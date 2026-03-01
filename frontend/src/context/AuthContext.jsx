@@ -71,14 +71,16 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
-  const register = async (email, password, name, role = "patient") => {
+  const register = async (email, password, name, role = "patient", referralCode = null) => {
     try {
+      const body = { email, password, name, role };
+      if (referralCode) body.referral_code = referralCode;
       const response = await fetch(`${BACKEND_URL}/api/auth/register`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ email, password, name, role })
+        body: JSON.stringify(body)
       });
 
       if (response.ok) {
@@ -90,6 +92,28 @@ export const AuthProvider = ({ children }) => {
       }
     } catch (error) {
       console.error("Registration error:", error);
+      throw error;
+    }
+  };
+
+  const demoLogin = async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/auth/demo`, {
+        method: "POST",
+        credentials: "include"
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setUser(data.user);
+        setIsAuthenticated(true);
+        return { success: true };
+      } else {
+        const error = await response.json();
+        throw new Error(error.detail || "Demo login failed");
+      }
+    } catch (error) {
+      console.error("Demo login error:", error);
       throw error;
     }
   };
@@ -116,6 +140,7 @@ export const AuthProvider = ({ children }) => {
         isAuthenticated,
         login,
         register,
+        demoLogin,
         logout,
         checkAuth
       }}

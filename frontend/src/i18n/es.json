@@ -90,6 +90,54 @@
     "en": "English",
     "es": "Español"
   },
+  "login": {
+    "tagline": "Tus recuerdos, siempre cerca",
+    "welcomeBack": "Bienvenido de Nuevo",
+    "createAccount": "Crear Cuenta",
+    "loginSubtitle": "Ingresa tus datos para acceder a tus recuerdos",
+    "registerSubtitle": "Comienza a preservar tus recuerdos hoy",
+    "fullName": "Nombre Completo",
+    "accountRole": "Tipo de Cuenta",
+    "email": "Correo Electrónico",
+    "password": "Contraseña",
+    "processing": "Procesando...",
+    "namePlaceholder": "ej. Juan Pérez",
+    "emailPlaceholder": "juan@ejemplo.com",
+    "noAccount": "¿No tienes cuenta? Regístrate",
+    "hasAccount": "¿Ya tienes cuenta? Inicia sesión",
+    "pendingApproval": "Registro enviado. Tu cuenta está pendiente de aprobación.",
+    "referralInvite": "¡Te han invitado! Crea tu cuenta para comenzar.",
+    "heroText": "Tus recuerdos preciosos merecen ser recordados",
+    "heroAlt": "Recuerdos familiares",
+    "footer": "Hecho con amor para ayudarte a recordar lo que más importa.",
+    "roles": {
+      "patient": "Paciente",
+      "caregiver": "Cuidador",
+      "clinician": "Médico",
+      "admin": "Admin (Con permisos)"
+    },
+    "features": {
+      "family": "Directorio Familiar",
+      "familyDesc": "Mantén la información de tus seres queridos en un lugar seguro",
+      "timeline": "Línea de Recuerdos",
+      "timelineDesc": "Guarda y revive tus recuerdos preciosos en cualquier momento",
+      "ai": "Asistente IA",
+      "aiDesc": "Haz preguntas sobre tu familia y recuerdos",
+      "privacy": "Seguro y Privado",
+      "privacyDesc": "Tus recuerdos están protegidos y solo visibles para ti"
+    }
+  },
+  "caregiver": {
+    "digestTitle": "Resumen Diario",
+    "digestDesc": "Obtén un resumen con IA del día de tu paciente — medicamentos, ánimo y alertas.",
+    "viewDigest": "Ver Resumen de Hoy",
+    "noAlerts": "Sin alertas",
+    "aiLimitReached": "Límite diario de IA alcanzado. Intenta mañana.",
+    "reportTitle": "Informe de Cuidado",
+    "reportDesc": "Descarga un PDF con los últimos 30 días — medicamentos, tendencias de ánimo y eventos de seguridad.",
+    "downloadReport": "Descargar Informe PDF",
+    "reportDownloaded": "¡Informe descargado!"
+  },
   "referral": {
     "title": "Invita a Tu Familia",
     "description": "Comparte AlzaHelp con familiares que cuidan a tu ser querido",

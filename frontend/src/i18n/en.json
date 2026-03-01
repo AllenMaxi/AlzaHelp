@@ -90,6 +90,54 @@
     "en": "English",
     "es": "Español"
   },
+  "login": {
+    "tagline": "Your memories, always close",
+    "welcomeBack": "Welcome Back",
+    "createAccount": "Create Account",
+    "loginSubtitle": "Enter your details to access your memories",
+    "registerSubtitle": "Start preserving your memories today",
+    "fullName": "Full Name",
+    "accountRole": "Account Role",
+    "email": "Email Address",
+    "password": "Password",
+    "processing": "Processing...",
+    "namePlaceholder": "e.g. John Doe",
+    "emailPlaceholder": "john@example.com",
+    "noAccount": "Don't have an account? Sign up",
+    "hasAccount": "Already have an account? Sign in",
+    "pendingApproval": "Registration submitted. Your account is pending admin approval.",
+    "referralInvite": "You've been invited! Create your account to get started.",
+    "heroText": "Your precious memories deserve to be remembered",
+    "heroAlt": "Family memories",
+    "footer": "Made with love to help you remember what matters most.",
+    "roles": {
+      "patient": "Patient",
+      "caregiver": "Caregiver",
+      "clinician": "Clinician",
+      "admin": "Admin (Allowlisted)"
+    },
+    "features": {
+      "family": "Family Directory",
+      "familyDesc": "Keep all your loved ones' information in one safe place",
+      "timeline": "Memory Timeline",
+      "timelineDesc": "Store and relive your precious memories anytime",
+      "ai": "AI Assistant",
+      "aiDesc": "Ask questions about your family and memories",
+      "privacy": "Safe & Private",
+      "privacyDesc": "Your memories are protected and only visible to you"
+    }
+  },
+  "caregiver": {
+    "digestTitle": "Daily Digest",
+    "digestDesc": "Get an AI-powered summary of your patient's day — medications, mood, and alerts.",
+    "viewDigest": "View Today's Digest",
+    "noAlerts": "No alerts",
+    "aiLimitReached": "Daily AI limit reached. Try again tomorrow.",
+    "reportTitle": "Care Report",
+    "reportDesc": "Download a PDF report of the last 30 days — medications, mood trends, and safety events.",
+    "downloadReport": "Download PDF Report",
+    "reportDownloaded": "Report downloaded!"
+  },
   "referral": {
     "title": "Invite Your Family",
     "description": "Share AlzaHelp with family members who care for your loved one",
