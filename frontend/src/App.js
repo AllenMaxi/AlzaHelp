@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { BrowserRouter, Routes, Route, useLocation, Navigate } from "react-router-dom";
 import "@/App.css";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
+import { LocationTrackingProvider } from "@/context/LocationTrackingContext";
 import { AuthCallback } from "@/components/auth/AuthCallback";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { LoginPage } from "@/pages/LoginPage";
@@ -58,10 +59,12 @@ function App() {
     <ErrorBoundary level="app">
       <AuthProvider>
         <BrowserRouter>
-          <div className="min-h-screen bg-background">
-            <AppRouter />
-            <Toaster position="top-center" richColors />
-          </div>
+          <LocationTrackingProvider>
+            <div className="min-h-screen bg-background">
+              <AppRouter />
+              <Toaster position="top-center" richColors />
+            </div>
+          </LocationTrackingProvider>
         </BrowserRouter>
       </AuthProvider>
     </ErrorBoundary>

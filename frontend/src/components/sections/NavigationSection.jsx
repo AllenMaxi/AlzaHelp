@@ -24,6 +24,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { useLocationTracking } from "@/context/LocationTrackingContext";
 import { destinationsApi, navigationApi, safetyApi } from "@/services/api";
 import { toast } from "sonner";
 
@@ -42,6 +43,26 @@ const distanceKm = (a, b) => {
   return 2 * earthKm * Math.asin(Math.sqrt(h));
 };
 
+const getNotificationDeliverySummary = (hookResults = []) => {
+  const safeResults = Array.isArray(hookResults) ? hookResults : [];
+  const sentCount = safeResults.reduce((total, result) => {
+    if (Number.isFinite(result?.sent_count)) return total + Number(result.sent_count);
+    return total + (result?.sent ? 1 : 0);
+  }, 0);
+  const reasons = new Set(safeResults.map((result) => result?.reason).filter(Boolean));
+  return {
+    sentCount,
+    hasNoContacts: reasons.has("no_emergency_contacts"),
+    hasNoPhoneNumbers: reasons.has("no_phone_numbers"),
+    hasNoConfiguredChannel: reasons.has("hook_not_configured") || reasons.has("sms_not_configured"),
+    hadFailures: safeResults.some(
+      (result) =>
+        !result?.sent &&
+        !["hook_not_configured", "sms_not_configured", "no_emergency_contacts", "no_phone_numbers"].includes(result?.reason)
+    ),
+  };
+};
+
 export const NavigationSection = ({ destinations = [], onRefresh, loading }) => {
   const [destinationDialogOpen, setDestinationDialogOpen] = useState(false);
   const [zoneDialogOpen, setZoneDialogOpen] = useState(false);
@@ -49,15 +70,10 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
   const [savingZone, setSavingZone] = useState(false);
   const [deletingDestination, setDeletingDestination] = useState(null);
   const [deletingZone, setDeletingZone] = useState(null);
-  const [locating, setLocating] = useState(false);
-  const [geoError, setGeoError] = useState("");
-  const [currentLocation, setCurrentLocation] = useState(null);
-
   const [safeZones, setSafeZones] = useState([]);
   const [safetyAlerts, setSafetyAlerts] = useState([]);
   const [emergencyContacts, setEmergencyContacts] = useState([]);
   const [fallEvents, setFallEvents] = useState([]);
-  const [pingingSafety, setPingingSafety] = useState(false);
   const [sharingLocation, setSharingLocation] = useState(false);
   const [triggeringSOS, setTriggeringSOS] = useState(false);
   const [reportingFall, setReportingFall] = useState(false);
@@ -74,8 +90,20 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
     intervals_csv: "5,15,30",
     enabled: true
   });
-  const lastPingRef = useRef(0);
   const lastFallReportRef = useRef(0);
+  const {
+    currentLocation,
+    locating,
+    geoError,
+    isTracking,
+    trackingMode,
+    runtimePlatform,
+    supportsNativeBackgroundTracking,
+    queueSize,
+    lastSyncedAt,
+    syncError,
+    refreshLocation,
+  } = useLocationTracking();
 
   const [guidanceDestinationId, setGuidanceDestinationId] = useState(null);
   const [guidanceLoading, setGuidanceLoading] = useState(false);
@@ -173,84 +201,15 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
     [loadSafetyData]
   );
 
-  const refreshLocation = () => {
-    if (!navigator.geolocation) {
-      setGeoError("This browser does not support GPS location.");
-      return;
-    }
-
-    setLocating(true);
-    setGeoError("");
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setCurrentLocation({
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          accuracy: position.coords.accuracy,
-          updatedAt: new Date().toISOString()
-        });
-        setLocating(false);
-      },
-      (error) => {
-        setLocating(false);
-        setGeoError(error.message || "Could not get your location.");
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
-    );
-  };
-
   useEffect(() => {
-    refreshLocation();
     loadSafetyData();
-    runEscalationCycle(true);
-  }, [loadSafetyData, runEscalationCycle]);
+  }, [loadSafetyData]);
 
   useEffect(() => {
     const timer = setInterval(() => {
-      runEscalationCycle(true);
+      loadSafetyData();
     }, 60000);
     return () => clearInterval(timer);
-  }, [runEscalationCycle]);
-
-  useEffect(() => {
-    if (!navigator.geolocation) return undefined;
-
-    const watcherId = navigator.geolocation.watchPosition(
-      (position) => {
-        const nextLocation = {
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          accuracy: position.coords.accuracy,
-          updatedAt: new Date().toISOString()
-        };
-        setCurrentLocation(nextLocation);
-
-        const now = Date.now();
-        if (now - lastPingRef.current < 30000) return;
-        lastPingRef.current = now;
-
-        setPingingSafety(true);
-        safetyApi
-          .pingLocation(nextLocation.latitude, nextLocation.longitude)
-          .then((result) => {
-            const alerts = result?.new_alerts || [];
-            if (alerts.length > 0) {
-              toast.error(`Safety alert: ${alerts[0].message}`);
-              loadSafetyData();
-            }
-          })
-          .catch(() => {
-            // No-op: passive monitoring should not spam errors.
-          })
-          .finally(() => setPingingSafety(false));
-      },
-      () => {
-        // Passive watcher error ignored; manual refresh still available.
-      },
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 15000 }
-    );
-
-    return () => navigator.geolocation.clearWatch(watcherId);
   }, [loadSafetyData]);
 
   useEffect(() => {
@@ -295,7 +254,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
 
     setSavingDestination(true);
     try {
-      await destinationsApi.create({
+      const saved = await destinationsApi.create({
         name: newDestination.name.trim(),
         address: newDestination.address.trim(),
         visit_time: newDestination.visit_time.trim() || null,
@@ -303,7 +262,13 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
         latitude,
         longitude
       });
-      toast.success("Destination added.");
+      if (saved?.geocoding_status === "geocoded") {
+        toast.success("Destination added and geocoded for real route guidance.");
+      } else if (saved?.geocoding_status === "manual") {
+        toast.success("Destination added with manual coordinates.");
+      } else {
+        toast.success("Destination added. Route guidance will fall back to address-only mode until coordinates are available.");
+      }
       setNewDestination({
         name: "",
         address: "",
@@ -318,6 +283,14 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
       toast.error("Could not save destination.");
     } finally {
       setSavingDestination(false);
+    }
+  };
+
+  const handleRefreshLocation = async () => {
+    try {
+      await refreshLocation();
+    } catch (_error) {
+      // Error is already reflected in provider state.
     }
   };
 
@@ -468,12 +441,23 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
     }
     setSharingLocation(true);
     try {
-      await safetyApi.shareLocation(
+      const result = await safetyApi.shareLocation(
         currentLocation.latitude,
         currentLocation.longitude,
         "manual_share"
       );
-      toast.success("Location shared with caregiver contacts.");
+      const delivery = getNotificationDeliverySummary(result?.hook_results);
+      if (delivery.sentCount > 0) {
+        toast.success(`Location shared. ${delivery.sentCount} notification${delivery.sentCount === 1 ? "" : "s"} sent.`);
+      } else if (delivery.hasNoContacts || delivery.hasNoPhoneNumbers) {
+        toast.success("Location saved, but no emergency contact phone numbers are configured.");
+      } else if (delivery.hasNoConfiguredChannel) {
+        toast.success("Location saved. No outbound notification channel is configured yet.");
+      } else if (delivery.hadFailures) {
+        toast.error("Location saved, but notifications could not be delivered right now.");
+      } else {
+        toast.success("Location saved.");
+      }
     } catch (error) {
       toast.error("Could not share location.");
     } finally {
@@ -490,7 +474,18 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
         message: "Patient requested emergency assistance.",
         auto_call_primary: true
       });
-      toast.error("SOS sent. Caregivers were notified.");
+      const delivery = getNotificationDeliverySummary(result?.hook_results);
+      if (delivery.sentCount > 0) {
+        toast.error(`SOS sent. ${delivery.sentCount} alert notification${delivery.sentCount === 1 ? "" : "s"} sent.`);
+      } else if (delivery.hasNoContacts || delivery.hasNoPhoneNumbers) {
+        toast.error("SOS saved, but no emergency contact phone numbers are configured.");
+      } else if (delivery.hasNoConfiguredChannel) {
+        toast.error("SOS saved. No outbound notification channel is configured yet.");
+      } else if (result?.dial_uri) {
+        toast.error("SOS saved. You can call the primary contact now.");
+      } else {
+        toast.error("SOS saved, but delivery could not be confirmed.");
+      }
       loadSafetyData();
 
       if (result?.dial_uri && window.confirm("Call primary emergency contact now?")) {
@@ -511,7 +506,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
     const destinationParam =
       destination.latitude != null && destination.longitude != null
         ? `${destination.latitude},${destination.longitude}`
-        : destination.address;
+        : destination.normalized_address || destination.address;
 
     const url = origin
       ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destinationParam)}&travelmode=walking`
@@ -587,7 +582,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
               <CardTitle className="flex items-center gap-2">
                 <LocateFixed className="h-5 w-5 text-primary" />
                 Current Location
-                {pingingSafety && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
+                {(locating || queueSize > 0) && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -597,14 +592,32 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
                     {currentLocation.latitude.toFixed(5)}, {currentLocation.longitude.toFixed(5)}
                   </p>
                   <p className="text-sm text-muted-foreground">
-                    Accuracy: {Math.round(currentLocation.accuracy)} meters
+                    Accuracy: {currentLocation.accuracy != null ? `${Math.round(currentLocation.accuracy)} meters` : "unknown"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Updated: {new Date(currentLocation.updatedAt).toLocaleString()}
                   </p>
                 </>
               ) : (
                 <p className="text-sm text-muted-foreground">Location not available yet.</p>
               )}
+              <p className="text-xs text-muted-foreground">
+                Tracking: {isTracking ? (trackingMode.startsWith("native") ? "native mobile active" : "active across dashboard") : "manual only"} · Mode: {trackingMode.replace(/_/g, " ")} · Platform: {runtimePlatform}
+              </p>
+              {runtimePlatform !== "web" && !supportsNativeBackgroundTracking && (
+                <p className="text-xs text-amber-600">
+                  Native shell detected, but no background location plugin is available yet. Tracking will pause when the OS suspends the app.
+                </p>
+              )}
+              {lastSyncedAt && (
+                <p className="text-xs text-muted-foreground">
+                  Last synced: {new Date(lastSyncedAt).toLocaleString()}
+                  {queueSize > 0 ? ` · ${queueSize} update${queueSize === 1 ? "" : "s"} queued` : ""}
+                </p>
+              )}
+              {syncError && <p className="text-xs text-destructive">{syncError}</p>}
               {geoError && <p className="text-sm text-destructive">{geoError}</p>}
-              <Button variant="outline" onClick={refreshLocation} disabled={locating} className="gap-2">
+              <Button variant="outline" onClick={handleRefreshLocation} disabled={locating} className="gap-2">
                 {locating ? <Loader2 className="h-4 w-4 animate-spin" /> : <LocateFixed className="h-4 w-4" />}
                 Refresh Location
               </Button>
@@ -751,7 +764,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
 
                     <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <Label htmlFor="dest-lat">Latitude (optional)</Label>
+                        <Label htmlFor="dest-lat">Latitude (optional, auto-filled from address if blank)</Label>
                         <Input
                           id="dest-lat"
                           value={newDestination.latitude}
@@ -763,7 +776,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
                         />
                       </div>
                       <div>
-                        <Label htmlFor="dest-lng">Longitude (optional)</Label>
+                        <Label htmlFor="dest-lng">Longitude (optional, auto-filled from address if blank)</Label>
                         <Input
                           id="dest-lng"
                           value={newDestination.longitude}
@@ -1132,7 +1145,7 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
                       <h3 className="text-xl font-semibold">{destination.name}</h3>
                       <p className="text-muted-foreground flex items-center gap-2">
                         <MapPin className="h-4 w-4" />
-                        {destination.address}
+                        {destination.normalized_address || destination.address}
                       </p>
                       {destination.visit_time && (
                         <p className="text-muted-foreground flex items-center gap-2">
@@ -1143,6 +1156,13 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
                       {destination.distance != null && (
                         <Badge variant="secondary">{destination.distance.toFixed(1)} km away</Badge>
                       )}
+                      <Badge variant={destination.geocoding_status === "geocoded" ? "default" : "outline"}>
+                        {destination.geocoding_status === "geocoded"
+                          ? "Geocoded"
+                          : destination.geocoding_status === "manual"
+                            ? "Manual coordinates"
+                            : "Address only"}
+                      </Badge>
                       {destination.notes && (
                         <p className="text-sm text-muted-foreground">{destination.notes}</p>
                       )}
@@ -1209,12 +1229,22 @@ export const NavigationSection = ({ destinations = [], onRefresh, loading }) => 
                 {guidanceResult.direction && (
                   <Badge variant="secondary">Direction: {guidanceResult.direction}</Badge>
                 )}
+                {guidanceResult.provider && (
+                  <Badge variant={guidanceResult.route_mode === "provider_route" ? "default" : "outline"}>
+                    {guidanceResult.route_mode === "provider_route"
+                      ? `Real route via ${guidanceResult.provider}`
+                      : "Fallback guidance"}
+                  </Badge>
+                )}
+                {guidanceResult.destination_address && (
+                  <Badge variant="outline">{guidanceResult.destination_address}</Badge>
+                )}
               </div>
               <ol className="space-y-2">
                 {(guidanceResult.steps || []).map((step, index) => (
                   <li key={`${step}-${index}`} className="text-sm flex gap-2">
                     <span className="font-semibold text-primary">{index + 1}.</span>
-                    <span>{step}</span>
+                    <span>{String(step).replace(/^Step\s+\d+:\s*/i, "")}</span>
                   </li>
                 ))}
               </ol>

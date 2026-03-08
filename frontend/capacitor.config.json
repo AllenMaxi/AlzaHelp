@@ -1,0 +1,17 @@
+{
+  "appId": "com.alzahelp.mobile",
+  "appName": "AlzaHelp",
+  "webDir": "build",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchAutoHide": true
+    },
+    "Geolocation": {
+      "permissionsPrompt": true
+    }
+  }
+}

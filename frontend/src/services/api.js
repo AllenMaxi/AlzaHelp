@@ -143,11 +143,20 @@ export const safetyApi = {
     });
   },
 
-  pingLocation: (latitude, longitude) =>
+  pingLocation: (latitudeOrPayload, longitude) =>
     fetchWithAuth('/api/safety/location-ping', {
       method: 'POST',
-      body: JSON.stringify({ latitude, longitude }),
+      body: JSON.stringify(
+        typeof latitudeOrPayload === 'object' && latitudeOrPayload !== null
+          ? latitudeOrPayload
+          : { latitude: latitudeOrPayload, longitude }
+      ),
     }),
+
+  getLocationState: (targetUserId) => {
+    const suffix = targetUserId ? `?target_user_id=${encodeURIComponent(targetUserId)}` : '';
+    return fetchWithAuth(`/api/safety/location-state${suffix}`);
+  },
 
   getAlerts: (targetUserId, onlyUnacknowledged = false) => {
     const params = new URLSearchParams();

@@ -20,6 +20,7 @@ import math
 import secrets
 import hmac
 import hashlib
+import mimetypes
 import zipfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -107,9 +108,19 @@ db = client[os.environ['DB_NAME']]
 
 # GridFS for file storage (safer than local storage)
 fs_bucket = AsyncIOMotorGridFSBucket(db)
+NAV_HTTP_USER_AGENT = os.environ.get("NAV_HTTP_USER_AGENT", "AlzaHelp/1.0 (care companion)").strip() or "AlzaHelp/1.0 (care companion)"
+GEOCODING_PROVIDER = os.environ.get("NAV_GEOCODING_PROVIDER", "nominatim").strip().lower() or "nominatim"
+GEOCODING_SEARCH_URL = os.environ.get("NAV_GEOCODING_SEARCH_URL", "https://nominatim.openstreetmap.org/search").strip()
+ROUTING_PROVIDER = os.environ.get("NAV_ROUTING_PROVIDER", "osrm").strip().lower() or "osrm"
+ROUTING_BASE_URL = os.environ.get("NAV_ROUTING_BASE_URL", "https://router.project-osrm.org/route/v1").strip().rstrip("/")
+LOCATION_STALE_SAMPLE_SECONDS = max(30, int(os.environ.get("NAV_LOCATION_STALE_SAMPLE_SECONDS", "180") or "180"))
+NOMINATIM_MIN_INTERVAL_SECONDS = max(1.0, float(os.environ.get("NAV_NOMINATIM_MIN_INTERVAL_SECONDS", "1.0") or "1.0"))
 
 # Create the main app without a prefix
 app = FastAPI(title="AlzaHelp API", version="1.0.0")
+background_scheduler = None
+_nominatim_lock = asyncio.Lock()
+_last_nominatim_request_at = 0.0
 
 # Rate limiting
 if _HAS_SLOWAPI:
@@ -543,6 +554,212 @@ def cardinal_direction(bearing: float) -> str:
     idx = round(bearing / 45) % 8
     return directions[idx]
 
+async def geocode_address(address: str) -> Optional[dict]:
+    """Resolve a human address into coordinates using the configured provider."""
+    query = (address or "").strip()
+    if not query:
+        return None
+    if GEOCODING_PROVIDER != "nominatim":
+        logger.warning("Unsupported geocoding provider configured: %s", GEOCODING_PROVIDER)
+        return None
+
+    global _last_nominatim_request_at
+    async with _nominatim_lock:
+        wait_seconds = NOMINATIM_MIN_INTERVAL_SECONDS - (asyncio.get_running_loop().time() - _last_nominatim_request_at)
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                headers={"User-Agent": NAV_HTTP_USER_AGENT, "Accept-Language": "en"},
+            ) as client:
+                response = await client.get(
+                    GEOCODING_SEARCH_URL,
+                    params={"q": query, "format": "jsonv2", "limit": 1, "addressdetails": 1},
+                )
+            _last_nominatim_request_at = asyncio.get_running_loop().time()
+            if response.status_code != 200:
+                logger.warning("Geocoding failed with status %s for %s", response.status_code, query)
+                return None
+            items = response.json() or []
+            if not items:
+                return None
+            item = items[0]
+            return {
+                "latitude": float(item["lat"]),
+                "longitude": float(item["lon"]),
+                "normalized_address": item.get("display_name") or query,
+                "provider": "nominatim",
+            }
+        except Exception as exc:
+            logger.warning("Geocoding failed for %s: %s", query, exc)
+            return None
+
+def _road_label(step: dict) -> str:
+    return step.get("name") or step.get("ref") or "the route"
+
+def format_route_step_instruction(step: dict, step_index: int, destination_name: str) -> str:
+    maneuver = step.get("maneuver") or {}
+    step_type = (maneuver.get("type") or "").lower()
+    modifier = (maneuver.get("modifier") or "").replace("_", " ").strip()
+    road_name = _road_label(step)
+    if step_type == "depart":
+        return f"Step {step_index}: Start and head {modifier or 'forward'} on {road_name}."
+    if step_type == "arrive":
+        return f"Step {step_index}: Arrive at {destination_name}."
+    if step_type == "turn":
+        return f"Step {step_index}: Turn {modifier or 'ahead'} onto {road_name}."
+    if step_type == "continue":
+        return f"Step {step_index}: Continue on {road_name}."
+    if step_type == "new name":
+        return f"Step {step_index}: Continue as {road_name}."
+    if step_type == "merge":
+        return f"Step {step_index}: Merge {modifier or 'ahead'} onto {road_name}."
+    if step_type == "fork":
+        return f"Step {step_index}: Keep {modifier or 'ahead'} at the fork toward {road_name}."
+    if step_type == "end of road":
+        return f"Step {step_index}: At the end of the road, turn {modifier or 'ahead'} onto {road_name}."
+    if step_type == "roundabout":
+        exit_no = maneuver.get("exit")
+        if exit_no:
+            return f"Step {step_index}: At the roundabout, take exit {exit_no} onto {road_name}."
+        return f"Step {step_index}: Enter the roundabout and continue onto {road_name}."
+    if step_type == "rotary":
+        return f"Step {step_index}: Go through the rotary toward {road_name}."
+    if step_type == "notification":
+        return f"Step {step_index}: Continue on {road_name}."
+    return f"Step {step_index}: Continue {modifier or 'ahead'} on {road_name}."
+
+async def fetch_routed_navigation(
+    start_latitude: float,
+    start_longitude: float,
+    end_latitude: float,
+    end_longitude: float,
+    destination_name: str,
+) -> Optional[dict]:
+    """Fetch real walking directions using the configured routing provider."""
+    if ROUTING_PROVIDER != "osrm" or not ROUTING_BASE_URL:
+        logger.warning("Unsupported routing provider configured: %s", ROUTING_PROVIDER)
+        return None
+
+    route_url = f"{ROUTING_BASE_URL}/walking/{start_longitude},{start_latitude};{end_longitude},{end_latitude}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": NAV_HTTP_USER_AGENT}) as client:
+            response = await client.get(
+                route_url,
+                params={
+                    "overview": "full",
+                    "geometries": "geojson",
+                    "steps": "true",
+                    "alternatives": "false",
+                    "annotations": "false",
+                },
+            )
+        if response.status_code != 200:
+            logger.warning("Routing failed with status %s", response.status_code)
+            return None
+        payload = response.json() or {}
+        routes = payload.get("routes") or []
+        if not routes:
+            return None
+        route = routes[0]
+        legs = route.get("legs") or []
+        steps_raw = []
+        for leg in legs:
+            steps_raw.extend(leg.get("steps") or [])
+        if not steps_raw:
+            return None
+
+        formatted_steps = []
+        for index, step in enumerate(steps_raw, start=1):
+            formatted_steps.append({
+                "index": index,
+                "instruction": format_route_step_instruction(step, index, destination_name),
+                "distance_meters": round(float(step.get("distance", 0.0)), 1),
+                "duration_seconds": round(float(step.get("duration", 0.0)), 1),
+                "maneuver_type": ((step.get("maneuver") or {}).get("type") or "").lower() or None,
+                "modifier": ((step.get("maneuver") or {}).get("modifier") or "").lower() or None,
+                "name": step.get("name") or None,
+                "mode": step.get("mode") or None,
+            })
+
+        return {
+            "provider": "osrm",
+            "route_mode": "provider_route",
+            "distance_meters": round(float(route.get("distance", 0.0)), 1),
+            "eta_minutes": max(1, int(round(float(route.get("duration", 0.0)) / 60))),
+            "steps": [step["instruction"] for step in formatted_steps],
+            "step_details": formatted_steps,
+            "geometry": route.get("geometry"),
+        }
+    except Exception as exc:
+        logger.warning("Routing failed: %s", exc)
+        return None
+
+async def resolve_destination_coordinates(address: str) -> Optional[dict]:
+    return await geocode_address(address)
+
+async def enrich_destination_coordinates(
+    user_id: str,
+    destination_doc: dict,
+    *,
+    address: Optional[str] = None,
+    force_geocode: bool = False,
+) -> dict:
+    working = {**destination_doc}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    address_value = (address or working.get("address") or "").strip()
+    latitude = working.get("latitude")
+    longitude = working.get("longitude")
+    if latitude is not None and longitude is not None and not force_geocode:
+        working.setdefault("geocoding_status", "manual")
+        working.setdefault("normalized_address", address_value or working.get("normalized_address"))
+        return working
+
+    geocoded = await resolve_destination_coordinates(address_value)
+    if geocoded:
+        working.update({
+            "latitude": geocoded["latitude"],
+            "longitude": geocoded["longitude"],
+            "normalized_address": geocoded.get("normalized_address") or address_value,
+            "geocoding_provider": geocoded.get("provider"),
+            "geocoding_status": "geocoded",
+            "geocoded_at": now_iso,
+            "updated_at": now_iso,
+        })
+        return working
+
+    working.update({
+        "normalized_address": address_value or working.get("normalized_address"),
+        "geocoding_provider": None,
+        "geocoding_status": "address_only",
+        "geocoded_at": None,
+        "updated_at": now_iso,
+    })
+    return working
+
+async def upsert_safety_location_state(user_id: str, ping: "SafetyLocationPing", *, received_at: datetime, stale_sample: bool) -> dict:
+    captured_at = parse_iso_to_utc(ping.captured_at) or received_at
+    location_state = {
+        "id": f"locstate_{user_id}",
+        "user_id": user_id,
+        "latitude": ping.latitude,
+        "longitude": ping.longitude,
+        "accuracy": ping.accuracy,
+        "source": (ping.source or "web_dashboard").strip()[:40],
+        "app_state": (ping.app_state or "foreground").strip()[:40],
+        "captured_at": captured_at.isoformat(),
+        "received_at": received_at.isoformat(),
+        "stale_sample": stale_sample,
+        "updated_at": received_at.isoformat(),
+    }
+    await db.safety_location_state.update_one(
+        {"user_id": user_id},
+        {"$set": location_state},
+        upsert=True,
+    )
+    return location_state
+
 def normalize_frequency(value: Optional[str], fallback: str = "daily") -> str:
     allowed = {"daily", "weekly", "as_needed"}
     if not value:
@@ -752,6 +969,45 @@ def extract_instruction_text_from_upload(
             return ""
 
     return ""
+
+def is_supported_instruction_upload(content_type: Optional[str], filename: Optional[str]) -> bool:
+    ctype = (content_type or "").lower()
+    ext = (Path(filename).suffix.lower() if filename else "")
+    if ext in {".txt", ".md", ".csv", ".json", ".pdf", ".docx"}:
+        return True
+    if ctype.startswith("text/"):
+        return True
+    if "application/pdf" in ctype:
+        return True
+    if "officedocument.wordprocessingml.document" in ctype:
+        return True
+    return ctype in {"application/json", "text/csv"}
+
+def derive_filename_from_content_type(prefix: str, content_type: Optional[str], fallback_ext: str = ".bin") -> str:
+    normalized = (content_type or "").split(";")[0].strip().lower()
+    ext = mimetypes.guess_extension(normalized) if normalized else None
+    if ext == ".jpe":
+        ext = ".jpg"
+    return f"{prefix}{ext or fallback_ext}"
+
+def build_upload_title_from_filename(filename: Optional[str]) -> str:
+    stem = Path(filename or "").stem.strip()
+    if not stem:
+        return "Uploaded Care Instruction"
+    cleaned = re.sub(r"[_\-]+", " ", stem)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.title() if cleaned else "Uploaded Care Instruction"
+
+def text_suggests_medication_policy(text: Optional[str]) -> bool:
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    keywords = [
+        "medication", "medicine", "tablet", "pill", "capsule", "dose",
+        "dosage", "take at", "take every", "regimen", "protocol",
+        "prescription", "morning pills", "evening pills"
+    ]
+    return any(keyword in lowered for keyword in keywords)
 
 def build_instruction_search_text(doc: dict) -> str:
     tags_text = " ".join(doc.get("tags") or [])
@@ -1093,8 +1349,12 @@ class Destination(BaseModel):
     user_id: str
     name: str
     address: str
+    normalized_address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    geocoding_provider: Optional[str] = None
+    geocoding_status: str = "pending"  # pending, geocoded, manual, address_only
+    geocoded_at: Optional[str] = None
     visit_time: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -1105,6 +1365,7 @@ class DestinationCreate(BaseModel):
     address: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    auto_geocode: bool = True
     visit_time: Optional[str] = None
     notes: Optional[str] = None
 
@@ -1113,6 +1374,7 @@ class DestinationUpdate(BaseModel):
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    auto_geocode: Optional[bool] = None
     visit_time: Optional[str] = None
     notes: Optional[str] = None
 
@@ -1149,6 +1411,10 @@ class SafetyZoneUpdate(BaseModel):
 class SafetyLocationPing(BaseModel):
     latitude: float
     longitude: float
+    accuracy: Optional[float] = None
+    captured_at: Optional[str] = None
+    source: Optional[str] = None
+    app_state: Optional[str] = None
 
 class EmergencyContact(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -1541,7 +1807,7 @@ async def resolve_target_user_id(
     return target_user_id
 
 async def get_alert_recipients(patient_user_id: str) -> List[dict]:
-    """Collect patient + accepted caregiver recipients for notifications."""
+    """Collect patient, caregivers, and emergency contacts for notifications."""
     recipients = []
     patient = await db.users.find_one(
         {"user_id": patient_user_id},
@@ -1561,6 +1827,23 @@ async def get_alert_recipients(patient_user_id: str) -> List[dict]:
             {"_id": 0, "user_id": 1, "name": 1, "email": 1, "role": 1}
         ).to_list(200)
         recipients.extend(caregivers)
+
+    emergency_contacts = await db.emergency_contacts.find(
+        {"user_id": patient_user_id},
+        {"_id": 0, "id": 1, "name": 1, "relationship": 1, "phone": 1, "receive_sms": 1, "receive_call": 1}
+    ).sort([("is_primary", -1), ("created_at", 1)]).to_list(20)
+    recipients.extend([
+        {
+            "user_id": contact.get("id"),
+            "name": contact.get("name"),
+            "phone": contact.get("phone"),
+            "role": "emergency_contact",
+            "relationship": contact.get("relationship"),
+            "receive_sms": bool(contact.get("receive_sms", True)),
+            "receive_call": bool(contact.get("receive_call", True)),
+        }
+        for contact in emergency_contacts
+    ])
 
     return recipients
 
@@ -1612,6 +1895,13 @@ async def dispatch_proactive_hooks(
             results.append(result)
         except Exception as exc:
             results.append({"channel": channel, "sent": False, "reason": str(exc)[:240]})
+
+    results.extend(await dispatch_emergency_contact_sms_fallback(
+        patient_user_id,
+        event_type,
+        severity,
+        payload
+    ))
 
     log_doc = {
         "id": f"notify_{uuid.uuid4().hex[:12]}",
@@ -1817,6 +2107,36 @@ async def process_due_alert_escalations(
         "processed_count": len(processed),
         "processed": processed,
         "run_at": now.isoformat()
+    }
+
+async def process_all_due_alert_escalations(
+    max_users: int = 100,
+    max_alerts_per_user: int = 20
+) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    due_query = {
+        "acknowledged": False,
+        "escalation_status": "active",
+        "escalation_next_at": {"$lte": now_iso}
+    }
+    user_ids = await db.safety_alerts.distinct("user_id", due_query)
+    processed_users = []
+    processed_alerts = 0
+    for user_id in user_ids[:max_users]:
+        result = await process_due_alert_escalations(
+            user_id,
+            max_alerts=max_alerts_per_user,
+            trigger_source="scheduler"
+        )
+        count = int(result.get("processed_count", 0))
+        if count > 0:
+            processed_users.append({"user_id": user_id, "processed_count": count})
+            processed_alerts += count
+    return {
+        "processed_user_count": len(processed_users),
+        "processed_alert_count": processed_alerts,
+        "processed_users": processed_users,
+        "run_at": now_iso
     }
 
 async def log_admin_audit(
@@ -2941,14 +3261,30 @@ async def create_destination(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new destination for route guidance"""
+    if (destination.latitude is None) != (destination.longitude is None):
+        raise HTTPException(status_code=400, detail="Latitude and longitude must be provided together")
     destination_obj = Destination(
         user_id=current_user.user_id,
-        **destination.model_dump()
+        **destination.model_dump(exclude={"auto_geocode"})
     )
 
     doc = destination_obj.model_dump()
-    doc["created_at"] = doc["created_at"].isoformat()
-    doc["updated_at"] = doc["updated_at"].isoformat()
+    if destination.latitude is not None and destination.longitude is not None:
+        doc["normalized_address"] = destination.address.strip()
+        doc["geocoding_status"] = "manual"
+        doc["geocoding_provider"] = None
+        doc["geocoded_at"] = None
+    elif destination.auto_geocode:
+        doc = await enrich_destination_coordinates(current_user.user_id, doc, address=destination.address, force_geocode=True)
+    else:
+        doc["normalized_address"] = destination.address.strip()
+        doc["geocoding_status"] = "address_only"
+        doc["geocoding_provider"] = None
+        doc["geocoded_at"] = None
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    if isinstance(doc.get("updated_at"), datetime):
+        doc["updated_at"] = doc["updated_at"].isoformat()
 
     await db.destinations.insert_one(doc)
 
@@ -2971,9 +3307,38 @@ async def update_destination(
     if not existing:
         raise HTTPException(status_code=404, detail="Destination not found")
 
-    update_data = {
-        k: v for k, v in destination_update.model_dump().items() if v is not None
-    }
+    raw_update = destination_update.model_dump(exclude_unset=True)
+    auto_geocode = raw_update.pop("auto_geocode", None)
+    if ("latitude" in raw_update) != ("longitude" in raw_update):
+        raise HTTPException(status_code=400, detail="Latitude and longitude must be provided together")
+
+    update_data = dict(raw_update)
+    address_changed = "address" in update_data and (update_data.get("address") or "").strip() != (existing.get("address") or "")
+    if "address" in update_data and isinstance(update_data["address"], str):
+        update_data["address"] = update_data["address"].strip()
+
+    if "latitude" in update_data and "longitude" in update_data:
+        update_data["geocoding_status"] = "manual"
+        update_data["normalized_address"] = update_data.get("address") or existing.get("normalized_address") or existing.get("address")
+        update_data["geocoding_provider"] = None
+        update_data["geocoded_at"] = None
+    elif address_changed and auto_geocode is not False:
+        enriched = await enrich_destination_coordinates(
+            current_user.user_id,
+            {**existing, **update_data},
+            address=update_data.get("address"),
+            force_geocode=True,
+        )
+        for key in ["latitude", "longitude", "normalized_address", "geocoding_provider", "geocoding_status", "geocoded_at"]:
+            update_data[key] = enriched.get(key)
+    elif address_changed:
+        update_data["normalized_address"] = update_data.get("address")
+        update_data["geocoding_status"] = "address_only"
+        update_data["geocoding_provider"] = None
+        update_data["geocoded_at"] = None
+        update_data["latitude"] = None
+        update_data["longitude"] = None
+
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     await db.destinations.update_one(
@@ -3009,13 +3374,48 @@ async def build_navigation_guide(
     request: NavigationGuideRequest,
     current_user: User = Depends(get_current_user)
 ):
-    """Generate simple in-app turn-by-turn style guidance."""
+    """Generate route guidance using a real routing provider when available."""
     destination = await db.destinations.find_one(
         {"id": request.destination_id, "user_id": current_user.user_id},
         {"_id": 0}
     )
     if not destination:
         raise HTTPException(status_code=404, detail="Destination not found")
+
+    if destination.get("latitude") is None or destination.get("longitude") is None:
+        enriched_destination = await enrich_destination_coordinates(
+            current_user.user_id,
+            destination,
+            address=destination.get("address"),
+            force_geocode=True,
+        )
+        if enriched_destination.get("latitude") is not None and enriched_destination.get("longitude") is not None:
+            destination = enriched_destination
+            persisted = {k: destination.get(k) for k in [
+                "latitude", "longitude", "normalized_address", "geocoding_provider", "geocoding_status", "geocoded_at", "updated_at"
+            ]}
+            await db.destinations.update_one(
+                {"id": request.destination_id, "user_id": current_user.user_id},
+                {"$set": persisted}
+            )
+
+    if destination.get("latitude") is not None and destination.get("longitude") is not None:
+        routed = await fetch_routed_navigation(
+            request.current_latitude,
+            request.current_longitude,
+            destination["latitude"],
+            destination["longitude"],
+            destination["name"],
+        )
+        if routed:
+            return {
+                "destination": destination["name"],
+                "destination_address": destination.get("normalized_address") or destination.get("address"),
+                "destination_latitude": destination.get("latitude"),
+                "destination_longitude": destination.get("longitude"),
+                "geocoding_status": destination.get("geocoding_status", "manual"),
+                **routed,
+            }
 
     if destination.get("latitude") is None or destination.get("longitude") is None:
         steps = [
@@ -3026,9 +3426,15 @@ async def build_navigation_guide(
         ]
         return {
             "destination": destination["name"],
+            "destination_address": destination.get("normalized_address") or destination.get("address"),
+            "destination_latitude": destination.get("latitude"),
+            "destination_longitude": destination.get("longitude"),
             "distance_meters": None,
             "eta_minutes": None,
             "direction": None,
+            "provider": "heuristic",
+            "route_mode": "heuristic_fallback",
+            "geocoding_status": destination.get("geocoding_status", "address_only"),
             "steps": steps
         }
 
@@ -3059,9 +3465,15 @@ async def build_navigation_guide(
 
     return {
         "destination": destination["name"],
+        "destination_address": destination.get("normalized_address") or destination.get("address"),
+        "destination_latitude": destination.get("latitude"),
+        "destination_longitude": destination.get("longitude"),
         "distance_meters": round(distance_m, 1),
         "eta_minutes": eta_minutes,
         "direction": direction,
+        "provider": "heuristic",
+        "route_mode": "heuristic_fallback",
+        "geocoding_status": destination.get("geocoding_status", "manual"),
         "steps": steps
     }
 
@@ -3240,12 +3652,31 @@ async def delete_safety_zone(
         raise HTTPException(status_code=404, detail="Safety zone not found")
     return {"message": "Safety zone deleted"}
 
+@api_router.get("/safety/location-state", response_model=dict)
+async def get_safety_location_state(
+    target_user_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    owner_id = await resolve_target_user_id(current_user, target_user_id)
+    state = await db.safety_location_state.find_one({"user_id": owner_id}, {"_id": 0})
+    return state or {}
+
 @api_router.post("/safety/location-ping", response_model=dict)
 async def safety_location_ping(
     ping: SafetyLocationPing,
     current_user: User = Depends(get_current_user)
 ):
     """Evaluate geofence state and create alerts if outside all active safe zones."""
+    now = datetime.now(timezone.utc)
+    captured_at = parse_iso_to_utc(ping.captured_at) or now
+    stale_sample = (now - captured_at).total_seconds() > LOCATION_STALE_SAMPLE_SECONDS
+    location_state = await upsert_safety_location_state(
+        current_user.user_id,
+        ping,
+        received_at=now,
+        stale_sample=stale_sample,
+    )
+
     zones = await db.safety_zones.find(
         {"user_id": current_user.user_id, "active": True},
         {"_id": 0}
@@ -3253,9 +3684,20 @@ async def safety_location_ping(
 
     evaluated = []
     outside_count = 0
-    now = datetime.now(timezone.utc)
     new_alerts = []
     hook_results = []
+
+    if stale_sample:
+        return {
+            "checked_at": now.isoformat(),
+            "captured_at": captured_at.isoformat(),
+            "stale_sample": True,
+            "evaluated_zones": evaluated,
+            "outside_count": outside_count,
+            "new_alerts": new_alerts,
+            "hook_results": hook_results,
+            "location_state": location_state,
+        }
 
     for zone in zones:
         distance = haversine_distance_m(
@@ -3311,10 +3753,13 @@ async def safety_location_ping(
 
     return {
         "checked_at": now.isoformat(),
+        "captured_at": captured_at.isoformat(),
+        "stale_sample": False,
         "evaluated_zones": evaluated,
         "outside_count": outside_count,
         "new_alerts": new_alerts,
-        "hook_results": hook_results
+        "hook_results": hook_results,
+        "location_state": location_state,
     }
 
 @api_router.get("/safety/alerts", response_model=List[dict])
@@ -4279,6 +4724,7 @@ async def build_doctor_patient_snapshot(patient_user_id: str, current_user: User
         {"user_id": owner_id, "acknowledged": False},
         {"_id": 0}
     ).sort("triggered_at", -1).to_list(50)
+    last_location_state = await db.safety_location_state.find_one({"user_id": owner_id}, {"_id": 0})
     today_plan = await build_patient_today_plan(owner_id)
     bpsd_analytics = await compute_bpsd_analytics(owner_id, 30)
 
@@ -4297,6 +4743,7 @@ async def build_doctor_patient_snapshot(patient_user_id: str, current_user: User
         "adherence_7d": adherence,
         "missed_doses": missed,
         "open_safety_alerts": open_alerts,
+        "last_location_state": last_location_state,
         "today_plan": today_plan,
         "bpsd_analytics_30d": bpsd_analytics
     }
@@ -4658,10 +5105,10 @@ async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.ogg"
         logger.warning(f"Audio transcription failed: {exc}")
         return None
 
-async def download_telegram_voice_file(file_id: str) -> Tuple[Optional[bytes], Optional[str]]:
+async def download_telegram_file(file_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        return None, None
+        return None, None, None
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             file_meta_resp = await client.post(
@@ -4671,15 +5118,20 @@ async def download_telegram_voice_file(file_id: str) -> Tuple[Optional[bytes], O
             file_meta = file_meta_resp.json() if file_meta_resp.status_code == 200 else {}
             file_path = (file_meta.get("result") or {}).get("file_path")
             if not file_path:
-                return None, None
+                return None, None, None
             file_resp = await client.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
             if file_resp.status_code != 200:
-                return None, None
+                return None, None, None
             name = file_path.split("/")[-1] if "/" in file_path else "telegram_audio.ogg"
-            return file_resp.content, name
+            content_type = file_resp.headers.get("content-type")
+            return file_resp.content, name, content_type
     except Exception as exc:
         logger.warning(f"Telegram voice download failed: {exc}")
-        return None, None
+        return None, None, None
+
+async def download_telegram_voice_file(file_id: str) -> Tuple[Optional[bytes], Optional[str]]:
+    audio_bytes, filename, _content_type = await download_telegram_file(file_id)
+    return audio_bytes, filename
 
 async def download_twilio_media(media_url: str) -> Tuple[Optional[bytes], Optional[str]]:
     if not media_url:
@@ -4908,6 +5360,159 @@ async def parse_care_instruction_from_text(text: str) -> dict:
     except Exception as e:
         logger.warning(f"parse_care_instruction_from_text failed: {e}")
         return {}
+
+async def infer_bot_instruction_upload_fields(
+    description_text: Optional[str],
+    extracted_text: str,
+    filename: Optional[str]
+) -> dict:
+    cleaned_description = (description_text or "").strip()
+    parsed = await parse_care_instruction_from_text(cleaned_description) if cleaned_description else {}
+
+    default_policy = "medication" if text_suggests_medication_policy(
+        "\n".join([cleaned_description, extracted_text[:1200], filename or ""])
+    ) else "general"
+    policy_type = normalize_policy_type(parsed.get("policy_type"), fallback=default_policy)
+
+    first_line = cleaned_description.splitlines()[0].strip() if cleaned_description else ""
+    title_candidates = [
+        (parsed.get("title") or "").strip(),
+        re.sub(r"^(add|upload|create)\s+(instruction|care instruction|care plan|protocol)\s*[:\-]\s*", "", first_line, flags=re.IGNORECASE).strip(),
+        build_upload_title_from_filename(filename),
+    ]
+    title = next((candidate for candidate in title_candidates if candidate), "Uploaded Care Instruction")
+    summary = (parsed.get("summary") or "").strip() or None
+    if not summary and cleaned_description and cleaned_description.lower() != title.lower():
+        summary = cleaned_description[:240]
+
+    instruction_hint = None
+    if cleaned_description and cleaned_description.lower() != title.lower():
+        instruction_hint = cleaned_description
+
+    return {
+        "title": title[:120].strip() or "Uploaded Care Instruction",
+        "summary": summary,
+        "instruction_text": instruction_hint,
+        "frequency": normalize_frequency(parsed.get("frequency"), fallback="daily"),
+        "day_of_week": normalize_day_of_week(parsed.get("day_of_week")),
+        "time_of_day": (parsed.get("time_of_day") or "").strip() or None,
+        "policy_type": policy_type,
+        "regimen_key": re.sub(r"\s+", "_", title.lower()).strip("_") if policy_type == "medication" else None,
+        "signoff_required": policy_type == "medication",
+    }
+
+async def create_care_instruction_from_upload_bytes(
+    owner_id: str,
+    uploader_user: User,
+    *,
+    content: bytes,
+    original_filename: Optional[str],
+    content_type: Optional[str],
+    title: str,
+    instruction_text: Optional[str] = None,
+    summary: Optional[str] = None,
+    frequency: str = "daily",
+    day_of_week: Optional[str] = None,
+    time_of_day: Optional[str] = None,
+    tags_csv: Optional[str] = None,
+    policy_type: str = "general",
+    regimen_key: Optional[str] = None,
+    effective_start_date: Optional[str] = None,
+    effective_end_date: Optional[str] = None,
+    signoff_required: Optional[bool] = None,
+    source_type: str = "file",
+) -> dict:
+    ext = Path(original_filename).suffix if original_filename else ""
+    if not ext:
+        ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip()) or ".bin"
+    storage_name = f"{owner_id}_{uuid.uuid4().hex[:8]}{ext}"
+    normalized_content_type = content_type or mimetypes.guess_type(original_filename or "")[0] or "application/octet-stream"
+
+    await fs_bucket.upload_from_stream(
+        storage_name,
+        io.BytesIO(content),
+        metadata={
+            "user_id": owner_id,
+            "content_type": normalized_content_type,
+            "original_filename": original_filename,
+            "uploaded_at": datetime.now(timezone.utc).isoformat()
+        }
+    )
+    file_url = f"/api/files/{storage_name}"
+
+    extracted_text = extract_instruction_text_from_upload(content, normalized_content_type, original_filename)
+    combined_text = "\n\n".join(
+        [part.strip() for part in [instruction_text or "", extracted_text] if part and part.strip()]
+    ).strip()
+    if not combined_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not extract text from this file. Provide instruction_text or upload txt/md/csv/json/pdf/docx."
+        )
+
+    normalized_policy = normalize_policy_type(policy_type)
+    normalized_regimen_key = (regimen_key or "").strip().lower() or (
+        re.sub(r"\s+", "_", title.strip().lower()) if normalized_policy == "medication" else None
+    )
+    effective_start = normalize_yyyy_mm_dd(effective_start_date)
+    effective_end = normalize_yyyy_mm_dd(effective_end_date)
+    if effective_start_date and not effective_start:
+        raise HTTPException(status_code=400, detail="effective_start_date must use YYYY-MM-DD")
+    if effective_end_date and not effective_end:
+        raise HTTPException(status_code=400, detail="effective_end_date must use YYYY-MM-DD")
+    if effective_start and effective_end and effective_end < effective_start:
+        raise HTTPException(status_code=400, detail="effective_end_date cannot be before effective_start_date")
+
+    requires_signoff = signoff_required if signoff_required is not None else (normalized_policy == "medication")
+    signoff_state = normalize_signoff_status(None, requires_signoff)
+
+    version_query = {"user_id": owner_id, "policy_type": normalized_policy}
+    if normalized_regimen_key:
+        version_query["regimen_key"] = normalized_regimen_key
+    latest = await db.care_instructions.find_one(version_query, {"_id": 0}, sort=[("version", -1), ("updated_at", -1)])
+    next_version = int(latest.get("version", 0) + 1) if latest else 1
+
+    tags = [tag.strip().lower() for tag in (tags_csv or "").split(",") if tag.strip()]
+    instruction_obj = CareInstruction(
+        user_id=owner_id,
+        title=title.strip(),
+        instruction_text=combined_text,
+        summary=summary.strip() if isinstance(summary, str) and summary.strip() else None,
+        frequency=normalize_frequency(frequency),
+        day_of_week=normalize_day_of_week(day_of_week),
+        time_of_day=time_of_day.strip() if isinstance(time_of_day, str) and time_of_day.strip() else None,
+        tags=tags,
+        policy_type=normalized_policy,
+        regimen_key=normalized_regimen_key,
+        version=next_version,
+        status="draft" if requires_signoff else "active",
+        effective_start_date=effective_start,
+        effective_end_date=effective_end,
+        signoff_required=requires_signoff,
+        signoff_status=signoff_state,
+        supersedes_instruction_id=latest.get("id") if latest else None,
+        active=False if requires_signoff else True,
+        source_type=source_type,
+        source_filename=original_filename,
+        source_file_url=file_url,
+        uploaded_by_user_id=uploader_user.user_id,
+        uploaded_by_role=uploader_user.role
+    )
+    doc = instruction_obj.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+    doc["search_text"] = build_instruction_search_text(doc)
+    await db.care_instructions.insert_one(doc)
+    doc["chunk_count"] = await upsert_instruction_chunks(doc)
+    if owner_id != uploader_user.user_id:
+        asyncio.create_task(notify_patient_update(
+            owner_id,
+            "instruction_added",
+            f"{uploader_user.name} added a care instruction: {title.strip()}. Your voice assistant has the details."
+        ))
+    doc.pop("_id", None)
+    doc.pop("search_text", None)
+    return doc
 
 
 async def handle_bot_add_medication(
@@ -5190,6 +5795,63 @@ async def handle_bot_update_medication(
     return f"Updated {matched.get('name', '')}: {changes}"
 
 
+async def handle_bot_upload_care_instruction_document(
+    doctor_user: User,
+    patient_user_id: str,
+    attachment: dict,
+    description_text: Optional[str] = None
+) -> str:
+    """Create a care instruction from an uploaded Telegram/WhatsApp document."""
+    try:
+        owner_id = await resolve_target_user_id(doctor_user, patient_user_id, require_write=True)
+    except HTTPException:
+        return "You do not have write access to this patient's records."
+
+    content = attachment.get("content") or b""
+    filename = attachment.get("filename") or "uploaded_instruction.bin"
+    content_type = attachment.get("content_type") or "application/octet-stream"
+    if not content:
+        return "I could not download that document. Please try again."
+    if not is_supported_instruction_upload(content_type, filename):
+        return "Unsupported file type. Please send a PDF, DOCX, TXT, MD, CSV, or JSON document."
+
+    extracted_text = extract_instruction_text_from_upload(content, content_type, filename)
+    if not extracted_text.strip():
+        return "I could not extract text from that document. Please upload a readable PDF, DOCX, TXT, MD, CSV, or JSON file."
+
+    fields = await infer_bot_instruction_upload_fields(description_text, extracted_text, filename)
+    doc = await create_care_instruction_from_upload_bytes(
+        owner_id,
+        doctor_user,
+        content=content,
+        original_filename=filename,
+        content_type=content_type,
+        title=fields["title"],
+        instruction_text=fields.get("instruction_text"),
+        summary=fields.get("summary"),
+        frequency=fields.get("frequency", "daily"),
+        day_of_week=fields.get("day_of_week"),
+        time_of_day=fields.get("time_of_day"),
+        policy_type=fields.get("policy_type", "general"),
+        regimen_key=fields.get("regimen_key"),
+        signoff_required=fields.get("signoff_required"),
+        source_type="file",
+    )
+
+    patient = await db.users.find_one({"user_id": owner_id}, {"_id": 0, "name": 1})
+    patient_name = (patient or {}).get("name", owner_id)
+    signoff_note = " Requires clinician sign-off before it becomes active." if doc.get("signoff_required") else ""
+    return (
+        f"Uploaded care document for {patient_name}:\n"
+        f"- Title: {doc.get('title')}\n"
+        f"- Type: {doc.get('policy_type', 'general')}\n"
+        f"- Status: {doc.get('status', 'active')}\n"
+        f"- Version: {doc.get('version', 1)}\n"
+        f"- Chunks indexed: {doc.get('chunk_count', 0)}."
+        f"{signoff_note}"
+    )
+
+
 # ==================== BOT QUERY HANDLER ====================
 
 async def handle_external_doctor_query(
@@ -5230,9 +5892,11 @@ async def handle_external_doctor_message(
     peer_id: str,
     peer_display_name: Optional[str],
     text: str,
-    prefer_voice: bool = False
+    prefer_voice: bool = False,
+    attachment: Optional[dict] = None
 ) -> dict:
     message_text = (text or "").strip()
+    logged_input = message_text or (f"[document] {attachment.get('filename', 'upload')}" if attachment else "")
     normalized_peer = normalize_external_peer_id(channel, peer_id)
 
     if re.match(r"^\s*(/link|link)\b", message_text, flags=re.IGNORECASE):
@@ -5246,23 +5910,23 @@ async def handle_external_doctor_message(
     )
     if not link:
         response_text = "This chat is not linked yet. In the app, generate a bot link code and send: /link YOUR_CODE"
-        await log_external_bot_message(channel, normalized_peer, None, None, message_text, response_text, "unlinked", "error")
+        await log_external_bot_message(channel, normalized_peer, None, None, logged_input, response_text, "unlinked", "error")
         return {"text": response_text, "voice_text": None, "status": "error", "intent": "unlinked"}
 
     doctor_doc = await db.users.find_one({"user_id": link.get("doctor_user_id")}, {"_id": 0})
     if not doctor_doc:
         response_text = "Linked doctor account was not found. Please relink this chat."
-        await log_external_bot_message(channel, normalized_peer, link.get("doctor_user_id"), None, message_text, response_text, "doctor_missing", "error")
+        await log_external_bot_message(channel, normalized_peer, link.get("doctor_user_id"), None, logged_input, response_text, "doctor_missing", "error")
         return {"text": response_text, "voice_text": None, "status": "error", "intent": "doctor_missing"}
 
     doctor_user = User(**doctor_doc)
     if not role_can_use_external_bot(doctor_user):
         response_text = "This account role is not allowed to use the external doctor bot."
-        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "forbidden_role", "error")
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, logged_input, response_text, "forbidden_role", "error")
         return {"text": response_text, "voice_text": None, "status": "error", "intent": "forbidden_role"}
     if doctor_user.role == "clinician" and doctor_user.clinician_approval_status != "approved":
         response_text = "Clinician account is not approved for bot access."
-        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "clinician_unapproved", "error")
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, logged_input, response_text, "clinician_unapproved", "error")
         return {"text": response_text, "voice_text": None, "status": "error", "intent": "clinician_unapproved"}
 
     if not _is_premium(doctor_doc):
@@ -5270,7 +5934,7 @@ async def handle_external_doctor_message(
             "External bot access requires AlzaHelp Premium ($9.99/mo). "
             "Visit your dashboard to upgrade and unlock Telegram/WhatsApp monitoring."
         )
-        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "premium_required", "error")
+        await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, logged_input, response_text, "premium_required", "error")
         return {"text": response_text, "voice_text": None, "status": "error", "intent": "premium_required"}
 
     if re.match(r"^\s*/patient\b", message_text, flags=re.IGNORECASE):
@@ -5321,8 +5985,58 @@ async def handle_external_doctor_message(
                     "Please select a patient first using /patient <patient_user_id>.\n"
                     f"Available patients:\n{listing}"
                 )
-            await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, message_text, response_text, "patient_required", "error")
+            await log_external_bot_message(channel, normalized_peer, doctor_user.user_id, None, logged_input, response_text, "patient_required", "error")
             return {"text": response_text, "voice_text": None, "status": "error", "intent": "patient_required"}
+
+    if attachment:
+        try:
+            response_text = await handle_bot_upload_care_instruction_document(
+                doctor_user,
+                selected_patient_id,
+                attachment,
+                message_text or None
+            )
+            intent = "upload_care_instruction_document"
+            await db.external_bot_links.update_one(
+                {"id": link["id"]},
+                {
+                    "$set": {
+                        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "peer_display_name": peer_display_name or link.get("peer_display_name")
+                    }
+                }
+            )
+            await log_external_bot_message(
+                channel,
+                normalized_peer,
+                doctor_user.user_id,
+                selected_patient_id,
+                logged_input,
+                response_text,
+                intent,
+                "ok"
+            )
+            return {
+                "text": response_text,
+                "voice_text": response_text if prefer_voice else None,
+                "status": "ok",
+                "intent": intent,
+                "patient_user_id": selected_patient_id
+            }
+        except HTTPException as exc:
+            response_text = f"Could not ingest that document: {exc.detail}"
+            await log_external_bot_message(
+                channel,
+                normalized_peer,
+                doctor_user.user_id,
+                selected_patient_id,
+                logged_input,
+                response_text,
+                "upload_care_instruction_document",
+                "error"
+            )
+            return {"text": response_text, "voice_text": None, "status": "error", "intent": "upload_care_instruction_document"}
 
     try:
         response_text, intent, _snapshot = await handle_external_doctor_query(
@@ -5345,7 +6059,7 @@ async def handle_external_doctor_message(
             normalized_peer,
             doctor_user.user_id,
             selected_patient_id,
-            message_text,
+            logged_input,
             response_text,
             intent,
             "ok"
@@ -5364,7 +6078,7 @@ async def handle_external_doctor_message(
             normalized_peer,
             doctor_user.user_id,
             selected_patient_id,
-            message_text,
+            logged_input,
             response_text,
             "query_error",
             "error"
@@ -6556,94 +7270,26 @@ async def create_care_instruction_with_upload(
     )
 
     content = await file.read()
-    ext = Path(file.filename).suffix if file.filename else ".bin"
-    filename = f"{owner_id}_{uuid.uuid4().hex[:8]}{ext}"
-    content_type = file.content_type or "application/octet-stream"
-
-    await fs_bucket.upload_from_stream(
-        filename,
-        io.BytesIO(content),
-        metadata={
-            "user_id": owner_id,
-            "content_type": content_type,
-            "original_filename": file.filename,
-            "uploaded_at": datetime.now(timezone.utc).isoformat()
-        }
-    )
-    file_url = f"/api/files/{filename}"
-
-    extracted_text = extract_instruction_text_from_upload(content, content_type, file.filename)
-    combined_text = "\n\n".join(
-        [p.strip() for p in [instruction_text or "", extracted_text] if p and p.strip()]
-    ).strip()
-    if not combined_text:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract text from this file. Provide instruction_text or upload txt/md/csv/json/pdf/docx."
-        )
-
-    normalized_policy = normalize_policy_type(policy_type)
-    normalized_regimen_key = (regimen_key or "").strip().lower() or (
-        re.sub(r"\s+", "_", title.strip().lower()) if normalized_policy == "medication" else None
-    )
-    effective_start = normalize_yyyy_mm_dd(effective_start_date)
-    effective_end = normalize_yyyy_mm_dd(effective_end_date)
-    if effective_start_date and not effective_start:
-        raise HTTPException(status_code=400, detail="effective_start_date must use YYYY-MM-DD")
-    if effective_end_date and not effective_end:
-        raise HTTPException(status_code=400, detail="effective_end_date must use YYYY-MM-DD")
-    if effective_start and effective_end and effective_end < effective_start:
-        raise HTTPException(status_code=400, detail="effective_end_date cannot be before effective_start_date")
-
-    requires_signoff = signoff_required if signoff_required is not None else (normalized_policy == "medication")
-    signoff_state = normalize_signoff_status(None, requires_signoff)
-
-    version_query = {"user_id": owner_id, "policy_type": normalized_policy}
-    if normalized_regimen_key:
-        version_query["regimen_key"] = normalized_regimen_key
-    latest = await db.care_instructions.find_one(version_query, {"_id": 0}, sort=[("version", -1), ("updated_at", -1)])
-    next_version = int(latest.get("version", 0) + 1) if latest else 1
-
-    tags = [t.strip().lower() for t in (tags_csv or "").split(",") if t.strip()]
-    instruction_obj = CareInstruction(
-        user_id=owner_id,
-        title=title.strip(),
-        instruction_text=combined_text,
-        summary=summary.strip() if summary else None,
-        frequency=normalize_frequency(frequency),
-        day_of_week=normalize_day_of_week(day_of_week),
-        time_of_day=time_of_day.strip() if time_of_day else None,
-        tags=tags,
-        policy_type=normalized_policy,
-        regimen_key=normalized_regimen_key,
-        version=next_version,
-        status="draft" if requires_signoff else "active",
-        effective_start_date=effective_start,
-        effective_end_date=effective_end,
-        signoff_required=requires_signoff,
-        signoff_status=signoff_state,
-        supersedes_instruction_id=latest.get("id") if latest else None,
-        active=False if requires_signoff else True,
+    return await create_care_instruction_from_upload_bytes(
+        owner_id,
+        current_user,
+        content=content,
+        original_filename=file.filename,
+        content_type=file.content_type,
+        title=title,
+        instruction_text=instruction_text,
+        summary=summary,
+        frequency=frequency,
+        day_of_week=day_of_week,
+        time_of_day=time_of_day,
+        tags_csv=tags_csv,
+        policy_type=policy_type,
+        regimen_key=regimen_key,
+        effective_start_date=effective_start_date,
+        effective_end_date=effective_end_date,
+        signoff_required=signoff_required,
         source_type="file",
-        source_filename=file.filename,
-        source_file_url=file_url,
-        uploaded_by_user_id=current_user.user_id,
-        uploaded_by_role=current_user.role
     )
-    doc = instruction_obj.model_dump()
-    doc["created_at"] = doc["created_at"].isoformat()
-    doc["updated_at"] = doc["updated_at"].isoformat()
-    doc["search_text"] = build_instruction_search_text(doc)
-    await db.care_instructions.insert_one(doc)
-    await upsert_instruction_chunks(doc)
-    if owner_id != current_user.user_id:
-        asyncio.create_task(notify_patient_update(
-            owner_id, "instruction_added",
-            f"{current_user.name} added a care instruction: {title.strip()}. Your voice assistant has the details."
-        ))
-    doc.pop("_id", None)
-    doc.pop("search_text", None)
-    return doc
 
 @api_router.put("/care/instructions/{instruction_id}", response_model=dict)
 async def update_care_instruction(
@@ -7817,6 +8463,7 @@ async def telegram_bot_webhook(request: Request):
 
     incoming_text = (message.get("text") or message.get("caption") or "").strip()
     prefer_voice = False
+    attachment = None
 
     if not incoming_text:
         voice_obj = message.get("voice") or message.get("audio")
@@ -7828,7 +8475,21 @@ async def telegram_bot_webhook(request: Request):
                 incoming_text = transcript
                 prefer_voice = True
 
-    if not incoming_text:
+    document_obj = message.get("document")
+    if isinstance(document_obj, dict):
+        document_file_id = document_obj.get("file_id")
+        document_name = document_obj.get("file_name") or "telegram_document"
+        document_type = document_obj.get("mime_type") or ""
+        if document_file_id and is_supported_instruction_upload(document_type, document_name):
+            content, downloaded_name, downloaded_type = await download_telegram_file(document_file_id)
+            if content:
+                attachment = {
+                    "content": content,
+                    "filename": document_name or downloaded_name or "telegram_document",
+                    "content_type": document_type or downloaded_type or "application/octet-stream",
+                }
+
+    if not incoming_text and not attachment:
         response_text = "I could not parse that message. Please send text or a clear voice note."
         await send_telegram_text_message(chat_id, response_text)
         await log_external_bot_message("telegram", chat_id, None, None, None, response_text, "parse_error", "error")
@@ -7839,7 +8500,8 @@ async def telegram_bot_webhook(request: Request):
         peer_id=chat_id,
         peer_display_name=display_name,
         text=incoming_text,
-        prefer_voice=prefer_voice
+        prefer_voice=prefer_voice,
+        attachment=attachment
     )
     text_send = await send_telegram_text_message(chat_id, result.get("text", ""))
     voice_send = None
@@ -7871,22 +8533,30 @@ async def whatsapp_bot_webhook(request: Request):
     from_peer = normalize_external_peer_id("whatsapp", form_data.get("From", ""))
     display_name = form_data.get("ProfileName", "WhatsApp User")
     incoming_text = (form_data.get("Body") or "").strip()
+    attachment = None
 
-    if not incoming_text:
-        try:
-            num_media = int(form_data.get("NumMedia", "0") or 0)
-        except Exception:
-            num_media = 0
-        if num_media > 0:
-            media_url = form_data.get("MediaUrl0", "")
-            media_type = (form_data.get("MediaContentType0") or "").lower()
-            if media_url and ("audio" in media_type or "ogg" in media_type):
-                audio_bytes, _ctype = await download_twilio_media(media_url)
-                transcript = await transcribe_audio_bytes(audio_bytes, "whatsapp_audio.ogg") if audio_bytes else None
-                if transcript:
-                    incoming_text = transcript
+    try:
+        num_media = int(form_data.get("NumMedia", "0") or 0)
+    except Exception:
+        num_media = 0
+    if num_media > 0:
+        media_url = form_data.get("MediaUrl0", "")
+        media_type = (form_data.get("MediaContentType0") or "").lower()
+        if media_url and ("audio" in media_type or "ogg" in media_type) and not incoming_text:
+            audio_bytes, _ctype = await download_twilio_media(media_url)
+            transcript = await transcribe_audio_bytes(audio_bytes, "whatsapp_audio.ogg") if audio_bytes else None
+            if transcript:
+                incoming_text = transcript
+        elif media_url and is_supported_instruction_upload(media_type, None):
+            media_bytes, downloaded_type = await download_twilio_media(media_url)
+            if media_bytes:
+                attachment = {
+                    "content": media_bytes,
+                    "filename": derive_filename_from_content_type("whatsapp_document", media_type or downloaded_type),
+                    "content_type": media_type or downloaded_type or "application/octet-stream",
+                }
 
-    if not incoming_text:
+    if not incoming_text and not attachment:
         reply_text = "I could not parse that message. Please send text or a clear voice note."
         await log_external_bot_message("whatsapp", from_peer, None, None, None, reply_text, "parse_error", "error")
         xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{xml_escape(reply_text)}</Message></Response>'
@@ -7897,7 +8567,8 @@ async def whatsapp_bot_webhook(request: Request):
         peer_id=from_peer,
         peer_display_name=display_name,
         text=incoming_text,
-        prefer_voice=False
+        prefer_voice=False,
+        attachment=attachment
     )
     reply_text = result.get("text", "Request processed.")
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{xml_escape(reply_text)}</Message></Response>'
@@ -7947,18 +8618,86 @@ async def notify_patient_update(patient_user_id: str, update_type: str, detail: 
     except Exception:
         pass
 
+def build_safety_sms_message(patient_name: str, event_type: str, severity: str, payload: dict) -> str:
+    normalized_event = (event_type or "alert").replace("_escalation", "")
+    label_map = {
+        "geofence_exit": "left a safe zone",
+        "fall_detected": "may have fallen",
+        "sos_trigger": "triggered SOS",
+        "location_share": "shared their current location",
+    }
+    event_label = label_map.get(normalized_event, normalized_event.replace("_", " "))
+    message = f"AlzaHelp {severity.upper()} alert: {patient_name} {event_label}."
+    zone_name = payload.get("zone_name")
+    if zone_name:
+        message += f" Zone: {zone_name}."
+    if payload.get("message"):
+        message += f" {str(payload.get('message'))[:120]}"
+    location = payload.get("location") or {}
+    latitude = location.get("latitude")
+    longitude = location.get("longitude")
+    if latitude is not None and longitude is not None:
+        message += f" Location: https://maps.google.com/?q={latitude},{longitude}"
+    return message[:480]
 
 async def send_sms_fallback(phone: str, message: str):
     """Send SMS via Twilio as fallback notification."""
     twilio_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
     if not all([TWILIO_SID, twilio_token, TWILIO_FROM, phone]):
-        return
+        return False
     try:
         from twilio.rest import Client as TwilioClient
         tc = TwilioClient(TWILIO_SID, twilio_token)
         tc.messages.create(body=message, from_=TWILIO_FROM, to=phone)
+        return True
     except Exception as e:
         logger.error("SMS send failed: %s", e)
+        return False
+
+async def dispatch_emergency_contact_sms_fallback(
+    patient_user_id: str,
+    event_type: str,
+    severity: str,
+    payload: dict
+) -> List[dict]:
+    if os.environ.get("ALERT_SMS_WEBHOOK_URL", "").strip():
+        return []
+
+    normalized_event = (event_type or "").replace("_escalation", "")
+    if normalized_event not in {"geofence_exit", "fall_detected", "sos_trigger", "location_share"}:
+        return []
+
+    contacts = await db.emergency_contacts.find(
+        {"user_id": patient_user_id, "receive_sms": True},
+        {"_id": 0, "name": 1, "phone": 1}
+    ).sort([("is_primary", -1), ("created_at", 1)]).to_list(5)
+    if not contacts:
+        return [{"channel": "sms_fallback", "sent": False, "sent_count": 0, "reason": "no_emergency_contacts"}]
+
+    twilio_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not all([TWILIO_SID, twilio_token, TWILIO_FROM]):
+        return [{"channel": "sms_fallback", "sent": False, "sent_count": 0, "reason": "sms_not_configured"}]
+
+    phone_numbers = [contact.get("phone") for contact in contacts if contact.get("phone")]
+    if not phone_numbers:
+        return [{"channel": "sms_fallback", "sent": False, "sent_count": 0, "reason": "no_phone_numbers"}]
+
+    patient_doc = await db.users.find_one({"user_id": patient_user_id}, {"_id": 0, "name": 1})
+    patient_name = (patient_doc or {}).get("name", patient_user_id)
+    sms_body = build_safety_sms_message(patient_name, event_type, severity, payload)
+
+    sent_count = 0
+    for phone in phone_numbers:
+        if await send_sms_fallback(phone, sms_body):
+            sent_count += 1
+
+    return [{
+        "channel": "sms_fallback",
+        "sent": sent_count > 0,
+        "sent_count": sent_count,
+        "attempted": len(phone_numbers),
+        "reason": None if sent_count > 0 else "sms_delivery_failed",
+    }]
 
 @api_router.post("/push/subscribe")
 async def subscribe_push(request: Request, current_user: User = Depends(get_current_user)):
@@ -8013,7 +8752,7 @@ async def check_medication_reminders():
                 if not intake:
                     user_doc = await db.users.find_one({"user_id": user_id})
                     if user_doc and _is_premium(user_doc):
-                        contacts = await db.safety_emergency_contacts.find({"user_id": user_id, "receive_sms": True}).to_list(5)
+                        contacts = await db.emergency_contacts.find({"user_id": user_id, "receive_sms": True}).to_list(5)
                         msg = f"AlzaHelp: {user_doc.get('name', 'Patient')} has a missed dose of {med['name']} ({med.get('dosage', '')})"
                         for contact in contacts:
                             if contact.get("phone"):
@@ -8058,8 +8797,13 @@ async def ensure_indexes():
     await db.reminders.create_index([("user_id", 1), ("active", 1)])
     await db.reminders.create_index("id", unique=True)
 
+    # Destinations
+    await db.destinations.create_index([("user_id", 1), ("created_at", -1)])
+    await db.destinations.create_index("id", unique=True)
+
     # Safety zones
     await db.safety_zones.create_index([("user_id", 1), ("active", 1)])
+    await db.safety_location_state.create_index("user_id", unique=True)
 
     # Chat history
     await db.chat_history.create_index([("user_id", 1), ("created_at", -1)])
@@ -8088,7 +8832,7 @@ async def ensure_indexes():
     await db.mood_checkins.create_index([("user_id", 1), ("created_at", -1)])
 
     # Instruction chunks (for RAG)
-    await db.instruction_chunks.create_index([("user_id", 1), ("instruction_id", 1)])
+    await db.care_instruction_chunks.create_index([("user_id", 1), ("instruction_id", 1)])
 
     # AI usage counters - TTL auto-cleanup after 7 days
     await db.ai_usage.create_index("date", expireAfterSeconds=86400 * 7)
@@ -8103,15 +8847,25 @@ async def setup_db_indexes():
 
 # Start scheduler on app startup
 @app.on_event("startup")
-async def start_medication_scheduler():
+async def start_background_schedulers():
+    global background_scheduler
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(check_medication_reminders, 'interval', minutes=1)
-        scheduler.start()
-        logger.info("Medication reminder scheduler started")
+        if background_scheduler is None:
+            background_scheduler = AsyncIOScheduler()
+            background_scheduler.add_job(check_medication_reminders, 'interval', minutes=1, id="medication-reminders", replace_existing=True)
+            background_scheduler.add_job(process_all_due_alert_escalations, 'interval', minutes=1, id="safety-escalations", replace_existing=True)
+            background_scheduler.start()
+        logger.info("Background schedulers started")
     except ImportError:
-        logger.warning("APScheduler not installed — medication reminders disabled")
+        logger.warning("APScheduler not installed — background schedulers disabled")
+
+@app.on_event("shutdown")
+async def stop_background_schedulers():
+    global background_scheduler
+    if background_scheduler is not None:
+        background_scheduler.shutdown(wait=False)
+        background_scheduler = None
 
 # ==================== LEGACY ROUTES ====================
 

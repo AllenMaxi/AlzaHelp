@@ -26,6 +26,9 @@ try:
         extract_patient_id_from_text,
         is_medication_taken_report,
         DOCTOR_BOT_WRITE_INTENTS,
+        is_supported_instruction_upload,
+        text_suggests_medication_policy,
+        build_upload_title_from_filename,
     )
 except ImportError:
     # Standalone fallback implementations (must match server.py exactly)
@@ -129,6 +132,42 @@ except ImportError:
         match = re.search(r"\buser_[a-z0-9]{12}\b", (text or "").lower())
         return match.group(0) if match else None
 
+    def is_supported_instruction_upload(content_type, filename):
+        ctype = (content_type or "").lower()
+        ext = ""
+        if filename and "." in filename:
+            ext = "." + filename.lower().rsplit(".", 1)[-1]
+        if ext in {".txt", ".md", ".csv", ".json", ".pdf", ".docx"}:
+            return True
+        if ctype.startswith("text/"):
+            return True
+        if "application/pdf" in ctype:
+            return True
+        if "officedocument.wordprocessingml.document" in ctype:
+            return True
+        return ctype in {"application/json", "text/csv"}
+
+    def text_suggests_medication_policy(text):
+        lowered = (text or "").lower()
+        if not lowered:
+            return False
+        keywords = [
+            "medication", "medicine", "tablet", "pill", "capsule", "dose",
+            "dosage", "take at", "take every", "regimen", "protocol",
+            "prescription", "morning pills", "evening pills"
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
+    def build_upload_title_from_filename(filename):
+        if not filename:
+            return "Uploaded Care Instruction"
+        stem = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0].strip()
+        if not stem:
+            return "Uploaded Care Instruction"
+        cleaned = re.sub(r"[_\-]+", " ", stem)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned.title() if cleaned else "Uploaded Care Instruction"
+
 
 # ==================== READ INTENT TESTS ====================
 
@@ -217,6 +256,22 @@ def test_write_intents_set():
     assert "deactivate_medication" in DOCTOR_BOT_WRITE_INTENTS
     assert "log_patient_intake" in DOCTOR_BOT_WRITE_INTENTS
     assert "update_medication" in DOCTOR_BOT_WRITE_INTENTS
+
+
+def test_supported_instruction_upload_pdf():
+    assert is_supported_instruction_upload("application/pdf", "protocol.pdf") is True
+
+
+def test_supported_instruction_upload_rejects_image():
+    assert is_supported_instruction_upload("image/png", "photo.png") is False
+
+
+def test_medication_policy_detection_from_text():
+    assert text_suggests_medication_policy("Morning medication protocol: take donepezil at 8am") is True
+
+
+def test_build_upload_title_from_filename():
+    assert build_upload_title_from_filename("weekly_medication_protocol.docx") == "Weekly Medication Protocol"
 
 
 # ==================== VOICE MEDICATION TAKEN DETECTOR ====================
