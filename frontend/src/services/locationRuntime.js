@@ -1,3 +1,11 @@
+import {
+  BACKGROUND_LOCATION_EVENTS,
+  BACKGROUND_LOCATION_METHODS,
+  BACKGROUND_LOCATION_PLUGIN_ALIASES,
+  DEFAULT_BACKGROUND_LOCATION_OPTIONS,
+  TRACKING_PROFILES,
+} from "@/services/backgroundLocationContract";
+
 const DEFAULT_ONE_SHOT_OPTIONS = {
   enableHighAccuracy: true,
   timeout: 10000,
@@ -85,8 +93,7 @@ const isNativePlatform = () => {
   return platform === "ios" || platform === "android";
 };
 
-const getBackgroundPlugin = () =>
-  getCapacitorPlugin("AlzaBackgroundLocation", "BackgroundGeolocation", "BackgroundLocation");
+const getBackgroundPlugin = () => getCapacitorPlugin(...BACKGROUND_LOCATION_PLUGIN_ALIASES);
 
 const getGeolocationPlugin = () => getCapacitorPlugin("Geolocation");
 
@@ -123,14 +130,14 @@ const startBrowserWatch = ({ onLocation, onError, options = DEFAULT_WATCH_OPTION
 };
 
 const startBackgroundPluginTracking = async (plugin, { onLocation, onError, watchOptions = DEFAULT_WATCH_OPTIONS }) => {
-  if (typeof plugin.addWatcher === "function") {
-    const watcherId = await plugin.addWatcher(
+  const profile = watchOptions.profile || 'safety';
+  const profileSettings = TRACKING_PROFILES[profile] || TRACKING_PROFILES.safety;
+
+  if (typeof plugin[BACKGROUND_LOCATION_METHODS.addWatcher] === "function") {
+    const watcherId = await plugin[BACKGROUND_LOCATION_METHODS.addWatcher](
       {
-        requestPermissions: true,
-        stale: false,
-        distanceFilter: 25,
-        backgroundTitle: "AlzaHelp location monitoring",
-        backgroundMessage: "Tracking location to keep safety alerts up to date.",
+        ...DEFAULT_BACKGROUND_LOCATION_OPTIONS,
+        ...profileSettings,
         ...watchOptions,
       },
       (location, error) => {
@@ -145,12 +152,12 @@ const startBackgroundPluginTracking = async (plugin, { onLocation, onError, watc
       }
     );
     return async () => {
-      if (typeof plugin.removeWatcher === "function") {
+      if (typeof plugin[BACKGROUND_LOCATION_METHODS.removeWatcher] === "function") {
         try {
-          await plugin.removeWatcher({ id: watcherId });
+          await plugin[BACKGROUND_LOCATION_METHODS.removeWatcher]({ id: watcherId });
           return;
         } catch (_error) {
-          await plugin.removeWatcher(watcherId);
+          await plugin[BACKGROUND_LOCATION_METHODS.removeWatcher](watcherId);
         }
       }
     };
@@ -158,7 +165,7 @@ const startBackgroundPluginTracking = async (plugin, { onLocation, onError, watc
 
   if (typeof plugin.addListener === "function" && (typeof plugin.startTracking === "function" || typeof plugin.start === "function")) {
     const listeners = [];
-    const locationListener = await plugin.addListener("location", (location) => {
+    const locationListener = await plugin.addListener(BACKGROUND_LOCATION_EVENTS.location, (location) => {
       const normalized = normalizePosition(location);
       if (normalized) {
         onLocation(normalized, { source: "native_background", appState: "background" });
@@ -167,7 +174,7 @@ const startBackgroundPluginTracking = async (plugin, { onLocation, onError, watc
     listeners.push(locationListener);
 
     if (typeof plugin.addListener === "function") {
-      const errorListener = await plugin.addListener("error", (error) => {
+      const errorListener = await plugin.addListener(BACKGROUND_LOCATION_EVENTS.error, (error) => {
         onError(new Error(toErrorMessage(error, "Native background tracking failed.")));
       });
       listeners.push(errorListener);
@@ -251,8 +258,8 @@ export const getLocationRuntimeInfo = () => {
 
 export const requestLocationPermissions = async () => {
   const backgroundPlugin = getBackgroundPlugin();
-  if (backgroundPlugin?.requestPermissions) {
-    return backgroundPlugin.requestPermissions();
+  if (backgroundPlugin?.[BACKGROUND_LOCATION_METHODS.requestPermissions]) {
+    return backgroundPlugin[BACKGROUND_LOCATION_METHODS.requestPermissions]();
   }
   const geolocationPlugin = getGeolocationPlugin();
   if (geolocationPlugin?.requestPermissions) {
@@ -264,13 +271,13 @@ export const requestLocationPermissions = async () => {
 export const getCurrentTrackedPosition = async (options = DEFAULT_ONE_SHOT_OPTIONS) => {
   const backgroundPlugin = getBackgroundPlugin();
   if (isNativePlatform() && backgroundPlugin) {
-    if (typeof backgroundPlugin.getCurrentPosition === "function") {
-      const position = await backgroundPlugin.getCurrentPosition(options);
+    if (typeof backgroundPlugin[BACKGROUND_LOCATION_METHODS.getCurrentPosition] === "function") {
+      const position = await backgroundPlugin[BACKGROUND_LOCATION_METHODS.getCurrentPosition](options);
       const normalized = normalizePosition(position);
       if (normalized) return normalized;
     }
-    if (typeof backgroundPlugin.getCurrentLocation === "function") {
-      const position = await backgroundPlugin.getCurrentLocation(options);
+    if (typeof backgroundPlugin[BACKGROUND_LOCATION_METHODS.getCurrentLocation] === "function") {
+      const position = await backgroundPlugin[BACKGROUND_LOCATION_METHODS.getCurrentLocation](options);
       const normalized = normalizePosition(position);
       if (normalized) return normalized;
     }
