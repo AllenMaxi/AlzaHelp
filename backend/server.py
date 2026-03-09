@@ -954,6 +954,119 @@ async def process_notification_delivery_queue(batch_size: int = 50):
         logger.error("Notification delivery sweep failed: %s", e)
 
 
+async def can_send_whatsapp_alert(recipient: dict, alert_doc: dict) -> tuple:
+    """Returns (allowed, template_sid_or_none)."""
+    if not recipient.get("whatsapp_opt_in"):
+        return False, None
+    last_inbound = recipient.get("whatsapp_last_inbound_at")
+    if last_inbound:
+        try:
+            last_dt = datetime.fromisoformat(last_inbound.replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - last_dt) < timedelta(hours=24):
+                return True, None  # free-form allowed within session
+        except Exception:
+            pass
+    event_type = alert_doc.get("event_type", "")
+    template_sid = WHATSAPP_ALERT_TEMPLATES.get(event_type)
+    if not template_sid:
+        return False, None
+    return True, template_sid
+
+
+def resolve_channel_address(recipient: dict, channel: str) -> str:
+    if channel == "sms":
+        return (recipient.get("phone") or "").strip()
+    if channel == "telegram":
+        return (recipient.get("telegram_chat_id") or "").strip()
+    if channel == "whatsapp":
+        return (recipient.get("phone") or "").strip()
+    if channel == "push":
+        return recipient.get("push_endpoint") or recipient.get("user_id", "")
+    return ""
+
+
+async def enqueue_alert_notifications(
+    alert_doc: dict,
+    is_escalation: bool = False,
+    escalation_stage: int = 0,
+):
+    """Enqueue per-recipient, per-channel delivery jobs based on severity policy."""
+    severity = normalize_severity(alert_doc.get("severity", "medium"))
+    policy = CHANNEL_DISPATCH_POLICY.get(severity, CHANNEL_DISPATCH_POLICY.get("medium", {}))
+    patient_user_id = alert_doc.get("user_id", "")
+
+    # Get recipients
+    recipients = await get_alert_recipients(patient_user_id)
+
+    # Build patient info for payload
+    patient_doc = await db.users.find_one({"user_id": patient_user_id}, {"name": 1})
+    patient_name = (patient_doc or {}).get("name", "Patient")
+    location_payload = alert_doc.get("payload", {}) if isinstance(alert_doc.get("payload"), dict) else {}
+    lat = location_payload.get("latitude") or location_payload.get("lat")
+    lon = location_payload.get("longitude") or location_payload.get("lon")
+    location_url = f"https://maps.google.com/?q={lat},{lon}" if lat and lon else ""
+
+    enriched_alert = {**alert_doc, "patient_name": patient_name, "location_url": location_url}
+
+    enqueued = []
+    for recipient in recipients:
+        channels_to_send = set(policy.get("immediate", []))
+
+        if is_escalation:
+            channels_to_send.update(policy.get("on_escalation", []))
+            for ch, threshold in policy.get("on_escalation_threshold", {}).items():
+                if escalation_stage >= threshold:
+                    channels_to_send.add(ch)
+
+        # Push: enqueue one job per subscription for this recipient
+        if "push" in channels_to_send:
+            channels_to_send.discard("push")
+            rid = recipient.get("user_id", recipient.get("id", ""))
+            subs = await db.push_subscriptions.find({"user_id": rid}).to_list(10)
+            for sub in subs:
+                await enqueue_delivery_job(enriched_alert, recipient, "push", sub.get("endpoint", ""))
+
+        # Telegram: check linked
+        if "telegram" in channels_to_send or "telegram" in policy.get("if_linked", []):
+            chat_id = recipient.get("telegram_chat_id", "")
+            if not chat_id:
+                rid = recipient.get("user_id", recipient.get("id", ""))
+                bot_user = await db.external_bot_users.find_one({
+                    "linked_patient_user_id": patient_user_id,
+                    "caregiver_user_id": rid,
+                    "platform": "telegram",
+                    "linked": True,
+                }, {"chat_id": 1})
+                chat_id = (bot_user or {}).get("chat_id", "")
+            if chat_id:
+                await enqueue_delivery_job(enriched_alert, recipient, "telegram", chat_id)
+            channels_to_send.discard("telegram")
+
+        # WhatsApp: policy-gated
+        if "whatsapp" in channels_to_send or "whatsapp" in policy.get("if_policy_allows", []):
+            allowed, template = await can_send_whatsapp_alert(recipient, enriched_alert)
+            if allowed:
+                phone = (recipient.get("phone") or "").strip()
+                if phone:
+                    await enqueue_delivery_job(enriched_alert, recipient, "whatsapp", phone, template_sid=template)
+            channels_to_send.discard("whatsapp")
+
+        # SMS
+        if "sms" in channels_to_send:
+            phone = (recipient.get("phone") or "").strip()
+            if phone:
+                await enqueue_delivery_job(enriched_alert, recipient, "sms", phone)
+            channels_to_send.discard("sms")
+
+    # Immediate first attempt for all pending jobs
+    try:
+        await process_notification_delivery_queue(batch_size=100)
+    except Exception as e:
+        logger.warning("Immediate notification sweep failed: %s", e)
+
+    return enqueued
+
+
 async def log_voice_medication_intake(owner_id: str, option: dict) -> dict:
     now_utc = datetime.now(timezone.utc)
     med_id = option.get("medication_id") or ""
@@ -2728,6 +2841,7 @@ async def create_safety_alert_with_escalation(
         severity=normalized_severity,
         payload={**payload, "alert_id": alert_doc["id"], "escalation_stage": 0}
     )
+    await enqueue_alert_notifications(alert_doc)
     await db.safety_escalation_events.insert_one({
         "id": f"escevt_{uuid.uuid4().hex[:12]}",
         "user_id": user_id,
@@ -2788,6 +2902,11 @@ async def process_due_alert_escalations(
             event_type=f"{alert.get('event_type', 'alert')}_escalation",
             severity=escalated_severity,
             payload=escalation_payload
+        )
+        await enqueue_alert_notifications(
+            alert,
+            is_escalation=True,
+            escalation_stage=next_stage,
         )
 
         next_at = None
@@ -4526,6 +4645,7 @@ async def acknowledge_safety_alert(
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Safety alert not found")
+    await cancel_pending_notifications_for_alert(alert_id)
     await db.safety_escalation_events.insert_one({
         "id": f"escevt_{uuid.uuid4().hex[:12]}",
         "user_id": owner_id,
@@ -9272,6 +9392,12 @@ async def whatsapp_bot_webhook(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Twilio signature")
 
     from_peer = normalize_external_peer_id("whatsapp", form_data.get("From", ""))
+    # Track WhatsApp session for 24h window
+    if from_peer:
+        await db.external_bot_users.update_many(
+            {"normalized_peer_id": from_peer, "platform": "whatsapp"},
+            {"$set": {"whatsapp_last_inbound_at": datetime.now(timezone.utc).isoformat()}}
+        )
     display_name = form_data.get("ProfileName", "WhatsApp User")
     incoming_text = (form_data.get("Body") or "").strip()
     attachment = None
