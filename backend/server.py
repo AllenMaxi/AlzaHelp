@@ -684,6 +684,135 @@ async def cancel_pending_notifications_for_alert(alert_id: str):
     return result.modified_count
 
 
+async def deliver_push_notification(job: dict) -> dict:
+    """Attempt web push delivery. Returns {sent, provider, provider_message_id, error, is_permanent}."""
+    try:
+        endpoint = job.get("channel_address", "")
+        if not endpoint:
+            return {"sent": False, "provider": "pywebpush", "error": "no_endpoint", "is_permanent": True}
+
+        sub = await db.push_subscriptions.find_one({"endpoint": endpoint})
+        if not sub:
+            return {"sent": False, "provider": "pywebpush", "error": "subscription_not_found", "is_permanent": True}
+
+        payload = job.get("payload", {})
+        push_data = json.dumps({
+            "title": payload.get("title", "AlzaHelp Alert"),
+            "body": payload.get("body", ""),
+            "url": "/dashboard",
+        })
+
+        from pywebpush import webpush
+        webpush(
+            subscription_info={"endpoint": sub["endpoint"], "keys": sub.get("keys", {})},
+            data=push_data,
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims=VAPID_CLAIMS,
+            timeout=10,
+        )
+        return {"sent": True, "provider": "pywebpush", "provider_message_id": None}
+    except Exception as e:
+        code = getattr(e, "response", None)
+        status = getattr(code, "status_code", 0) if code else 0
+        if status in (404, 410):
+            await db.push_subscriptions.delete_one({"endpoint": job.get("channel_address", "")})
+            return {"sent": False, "provider": "pywebpush", "error": "stale_subscription", "is_permanent": True}
+        failure_type = classify_delivery_failure("push", e, status)
+        return {"sent": False, "provider": "pywebpush", "error": str(e)[:200], "is_permanent": failure_type == "permanent"}
+
+
+async def deliver_sms(job: dict) -> dict:
+    phone = job.get("channel_address", "")
+    if not phone:
+        return {"sent": False, "provider": "twilio", "error": "no_phone", "is_permanent": True}
+    twilio_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not all([TWILIO_SID, twilio_token, TWILIO_FROM]):
+        return {"sent": False, "provider": "twilio", "error": "sms_not_configured", "is_permanent": True}
+    try:
+        from twilio.rest import Client as TwilioClient
+        tc = TwilioClient(TWILIO_SID, twilio_token)
+        payload = job.get("payload", {})
+        body = build_safety_sms_message(
+            payload.get("patient_name", "Patient"),
+            payload.get("event_type", "alert"),
+            payload.get("severity", "high"),
+            payload,
+        )
+        msg = tc.messages.create(body=body, from_=TWILIO_FROM, to=phone)
+        return {"sent": True, "provider": "twilio", "provider_message_id": msg.sid}
+    except Exception as e:
+        failure_type = classify_delivery_failure("sms", e)
+        return {"sent": False, "provider": "twilio", "error": str(e)[:200], "is_permanent": failure_type == "permanent"}
+
+
+async def deliver_telegram(job: dict) -> dict:
+    chat_id = job.get("channel_address", "")
+    if not chat_id:
+        return {"sent": False, "provider": "telegram_api", "error": "no_chat_id", "is_permanent": True}
+    payload = job.get("payload", {})
+    severity = (payload.get("severity", "medium")).upper()
+    event_label = (payload.get("event_type", "alert")).replace("_", " ").title()
+    patient = payload.get("patient_name", "Patient")
+    body = payload.get("body", "Safety alert triggered")
+    location_url = payload.get("location_url", "")
+    text = f"[{severity}] {event_label} — {patient}\n{body}"
+    if location_url:
+        text += f"\nLocation: {location_url}"
+    result = await send_telegram_text_message(chat_id, text)
+    if result and result.get("sent"):
+        mid = result.get("message_id")
+        return {"sent": True, "provider": "telegram_api", "provider_message_id": str(mid) if mid else None}
+    status_code = result.get("status_code", 0) if result else 0
+    failure_type = classify_delivery_failure("telegram", Exception("send failed"), status_code)
+    return {"sent": False, "provider": "telegram_api", "error": f"status={status_code}", "is_permanent": failure_type == "permanent"}
+
+
+async def deliver_whatsapp(job: dict) -> dict:
+    phone = job.get("channel_address", "")
+    if not phone:
+        return {"sent": False, "provider": "twilio", "error": "no_phone", "is_permanent": True}
+    wa_from = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
+    twilio_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not all([TWILIO_SID, twilio_token, wa_from]):
+        return {"sent": False, "provider": "twilio", "error": "whatsapp_not_configured", "is_permanent": True}
+    try:
+        from twilio.rest import Client as TwilioClient
+        tc = TwilioClient(TWILIO_SID, twilio_token)
+        template_sid = job.get("template_sid")
+        if template_sid:
+            payload = job.get("payload", {})
+            msg = tc.messages.create(
+                content_sid=template_sid,
+                content_variables=json.dumps({
+                    "1": payload.get("patient_name", "Patient"),
+                    "2": (payload.get("event_type", "alert")).replace("_", " ").title(),
+                }),
+                from_=f"whatsapp:{wa_from}",
+                to=f"whatsapp:{phone}",
+            )
+        else:
+            payload = job.get("payload", {})
+            body = build_safety_sms_message(
+                payload.get("patient_name", "Patient"),
+                payload.get("event_type", "alert"),
+                payload.get("severity", "high"),
+                payload,
+            )
+            msg = tc.messages.create(body=body, from_=f"whatsapp:{wa_from}", to=f"whatsapp:{phone}")
+        return {"sent": True, "provider": "twilio", "provider_message_id": msg.sid}
+    except Exception as e:
+        failure_type = classify_delivery_failure("whatsapp", e)
+        return {"sent": False, "provider": "twilio", "error": str(e)[:200], "is_permanent": failure_type == "permanent"}
+
+
+CHANNEL_HANDLERS = {
+    "push": deliver_push_notification,
+    "sms": deliver_sms,
+    "telegram": deliver_telegram,
+    "whatsapp": deliver_whatsapp,
+}
+
+
 async def log_voice_medication_intake(owner_id: str, option: dict) -> dict:
     now_utc = datetime.now(timezone.utc)
     med_id = option.get("medication_id") or ""
