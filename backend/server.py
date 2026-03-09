@@ -1,6 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
@@ -27,8 +26,40 @@ import zipfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 from openai import AsyncOpenAI
-from passlib.context import CryptContext
 from jose import JWTError, jwt
+
+# ── Core modules (extracted from this file) ──
+from core.config import (
+    SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS,
+    COOKIE_SAMESITE, COOKIE_SECURE, ENFORCE_HTTPS,
+    VOICE_CONFIRMATION_TTL_SECONDS,
+    NOTIFICATION_MAX_ATTEMPTS, NOTIFICATION_BACKOFF_BASE_SECONDS,
+    NOTIFICATION_BACKOFF_MAX_SECONDS, NOTIFICATION_LEASE_SECONDS,
+    CHANNEL_DISPATCH_POLICY, WHATSAPP_ALERT_TEMPLATES, TRANSIENT_HTTP_CODES,
+    WRITE_RATE_LIMIT_ENABLED, WRITE_RATE_LIMIT_WINDOW_SECONDS,
+    WRITE_RATE_LIMIT_MAX_REQUESTS, WRITE_RATE_LIMIT_EXEMPT_PREFIXES,
+    stripe_lib, _HAS_STRIPE, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID,
+    PATIENT_LIMITS,
+    NAV_HTTP_USER_AGENT, GEOCODING_PROVIDER, GEOCODING_SEARCH_URL,
+    ROUTING_PROVIDER, ROUTING_BASE_URL,
+    LOCATION_STALE_SAMPLE_SECONDS, NOMINATIM_MIN_INTERVAL_SECONDS,
+    EMBEDDING_MODEL, RAG_CHUNK_SIZE_CHARS, RAG_CHUNK_OVERLAP_CHARS,
+    SEVERITY_ORDER, SAFETY_EVENT_TYPES, DEFAULT_ESCALATION_RULE_TEMPLATES,
+    BPSD_SYMPTOM_TAXONOMY, BPSD_TIME_OF_DAY,
+    EXTERNAL_BOT_CHANNELS, EXTERNAL_BOT_ALLOWED_ROLES,
+    DOCTOR_BOT_INTENTS, DOCTOR_BOT_WRITE_INTENTS,
+    ALLOWED_MIME_TYPES, ALLOWED_EXTENSIONS, MAX_FILE_SIZE_BYTES,
+    TWILIO_SID, TWILIO_FROM,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_WEBHOOK_SECRET,
+    VAPID_PRIVATE_KEY, VAPID_CLAIMS,
+    ALERT_PUSH_WEBHOOK_URL, ALERT_EMAIL_WEBHOOK_URL, ALERT_SMS_WEBHOOK_URL,
+    ADMIN_BOOTSTRAP_EMAILS_RAW, CORS_ORIGINS,
+)
+from core.database import client, db, fs_bucket
+from core.security import (
+    pwd_context, verify_password, get_password_hash,
+    validate_password_strength, create_access_token, create_refresh_token,
+)
 
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -39,31 +70,13 @@ except ImportError:
     _HAS_SLOWAPI = False
 
 try:
-    import stripe as stripe_lib
-    _stripe_key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-    if _stripe_key:
-        stripe_lib.api_key = _stripe_key
-        _HAS_STRIPE = True
-    else:
-        _HAS_STRIPE = False
-except ImportError:
-    stripe_lib = None
-    _HAS_STRIPE = False
-
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "").strip()
-
-# Patient limits per subscription tier
-PATIENT_LIMITS = {"free": 3, "premium": 20}
-
-try:
     from pypdf import PdfReader
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     PdfReader = None
 
 try:
     from docx import Document as DocxDocument
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     DocxDocument = None
 
 try:
@@ -76,68 +89,6 @@ try:
 except ImportError:
     _HAS_REPORTLAB = False
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
-
-# Auth Configuration
-_jwt_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
-REQUIRE_JWT_SECRET = os.environ.get("REQUIRE_JWT_SECRET", "false").strip().lower() == "true"
-if REQUIRE_JWT_SECRET and not _jwt_secret:
-    raise RuntimeError("JWT_SECRET_KEY must be set when REQUIRE_JWT_SECRET=true")
-if not _jwt_secret:
-    _jwt_secret = secrets.token_hex(32)
-    logging.getLogger(__name__).warning("JWT_SECRET_KEY not set — generated ephemeral key. Tokens will not survive restarts.")
-SECRET_KEY = _jwt_secret
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
-REFRESH_TOKEN_EXPIRE_DAYS = 30
-COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "lax")
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
-ENFORCE_HTTPS = os.environ.get("ENFORCE_HTTPS", "false").strip().lower() == "true"
-VOICE_CONFIRMATION_TTL_SECONDS = max(60, int(os.environ.get("VOICE_CONFIRMATION_TTL_SECONDS", "600") or "600"))
-
-# ── Notification delivery queue ──
-NOTIFICATION_MAX_ATTEMPTS = int(os.environ.get("NOTIFICATION_MAX_ATTEMPTS", "5"))
-NOTIFICATION_BACKOFF_BASE_SECONDS = int(os.environ.get("NOTIFICATION_BACKOFF_BASE_SECONDS", "30"))
-NOTIFICATION_BACKOFF_MAX_SECONDS = int(os.environ.get("NOTIFICATION_BACKOFF_MAX_SECONDS", "1800"))
-NOTIFICATION_LEASE_SECONDS = 60
-
-CHANNEL_DISPATCH_POLICY = {
-    "critical": {
-        "immediate": ["push", "sms", "telegram"],
-        "if_policy_allows": ["whatsapp"],
-    },
-    "high": {
-        "immediate": ["push", "telegram"],
-        "on_escalation": ["sms"],
-        "if_policy_allows": ["whatsapp"],
-    },
-    "medium": {
-        "immediate": ["push", "telegram"],
-        "on_escalation_threshold": {"sms": 2},
-    },
-    "low": {
-        "immediate": ["push"],
-        "if_linked": ["telegram"],
-    },
-}
-
-WHATSAPP_ALERT_TEMPLATES = {
-    "sos_trigger": os.environ.get("TWILIO_WA_TEMPLATE_SOS", "").strip() or None,
-    "fall_detected": os.environ.get("TWILIO_WA_TEMPLATE_FALL", "").strip() or None,
-    "geofence_exit": os.environ.get("TWILIO_WA_TEMPLATE_GEOFENCE", "").strip() or None,
-    "missed_medication_dose": os.environ.get("TWILIO_WA_TEMPLATE_MISSED_MED", "").strip() or None,
-}
-
-TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
-
-WRITE_RATE_LIMIT_ENABLED = os.environ.get("WRITE_RATE_LIMIT_ENABLED", "true").strip().lower() == "true"
-WRITE_RATE_LIMIT_WINDOW_SECONDS = max(10, int(os.environ.get("WRITE_RATE_LIMIT_WINDOW_SECONDS", "60") or "60"))
-WRITE_RATE_LIMIT_MAX_REQUESTS = max(10, int(os.environ.get("WRITE_RATE_LIMIT_MAX_REQUESTS", "120") or "120"))
-
-# Password hashing configuration
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 # Initialize OpenAI client (lazy initialization)
 openai_client = None
 
@@ -147,42 +98,12 @@ def get_openai_client():
         openai_client = AsyncOpenAI(api_key=os.environ.get('OPENAI_API_KEY', ''))
     return openai_client
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# GridFS for file storage (safer than local storage)
-fs_bucket = AsyncIOMotorGridFSBucket(db)
-NAV_HTTP_USER_AGENT = os.environ.get("NAV_HTTP_USER_AGENT", "AlzaHelp/1.0 (care companion)").strip() or "AlzaHelp/1.0 (care companion)"
-GEOCODING_PROVIDER = os.environ.get("NAV_GEOCODING_PROVIDER", "nominatim").strip().lower() or "nominatim"
-GEOCODING_SEARCH_URL = os.environ.get("NAV_GEOCODING_SEARCH_URL", "https://nominatim.openstreetmap.org/search").strip()
-ROUTING_PROVIDER = os.environ.get("NAV_ROUTING_PROVIDER", "osrm").strip().lower() or "osrm"
-ROUTING_BASE_URL = os.environ.get("NAV_ROUTING_BASE_URL", "https://router.project-osrm.org/route/v1").strip().rstrip("/")
-LOCATION_STALE_SAMPLE_SECONDS = max(30, int(os.environ.get("NAV_LOCATION_STALE_SAMPLE_SECONDS", "180") or "180"))
-NOMINATIM_MIN_INTERVAL_SECONDS = max(1.0, float(os.environ.get("NAV_NOMINATIM_MIN_INTERVAL_SECONDS", "1.0") or "1.0"))
-
 # Create the main app without a prefix
 app = FastAPI(title="AlzaHelp API", version="1.0.0")
 background_scheduler = None
 _nominatim_lock = asyncio.Lock()
 _last_nominatim_request_at = 0.0
 _write_request_buckets = defaultdict(deque)
-
-WRITE_RATE_LIMIT_EXEMPT_PREFIXES = (
-    "/health",
-    "/api/auth/login",
-    "/api/auth/register",
-    "/api/auth/refresh",
-    "/api/auth/logout",
-    "/api/auth/demo",
-    "/api/voice-command",
-    "/api/voice/transcribe",
-    "/api/tts",
-    "/api/safety/location-ping",
-    "/api/safety/escalations/run",
-    "/api/webhooks/",
-)
 
 # Rate limiting
 if _HAS_SLOWAPI:
@@ -206,87 +127,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
-RAG_CHUNK_SIZE_CHARS = int(os.environ.get("RAG_CHUNK_SIZE_CHARS", "900"))
-RAG_CHUNK_OVERLAP_CHARS = int(os.environ.get("RAG_CHUNK_OVERLAP_CHARS", "160"))
-
-SEVERITY_ORDER = {
-    "low": 1,
-    "medium": 2,
-    "high": 3,
-    "critical": 4
-}
-
-SAFETY_EVENT_TYPES = {
-    "all",
-    "geofence_exit",
-    "sos_trigger",
-    "fall_detected",
-    "missed_medication_dose",
-    "location_share"
-}
-
-DEFAULT_ESCALATION_RULE_TEMPLATES = [
-    {"event_type": "geofence_exit", "min_severity": "high", "intervals_minutes": [5, 15, 30], "enabled": True},
-    {"event_type": "sos_trigger", "min_severity": "critical", "intervals_minutes": [2, 5, 15], "enabled": True},
-    {"event_type": "fall_detected", "min_severity": "high", "intervals_minutes": [3, 10, 20], "enabled": True},
-    {"event_type": "missed_medication_dose", "min_severity": "high", "intervals_minutes": [30, 120], "enabled": True},
-]
-
-BPSD_SYMPTOM_TAXONOMY = [
-    "agitation",
-    "sundowning",
-    "wandering",
-    "sleep_disturbance",
-    "appetite_change",
-    "anxiety",
-    "depression",
-    "apathy",
-    "confusion",
-    "aggression",
-    "hallucinations",
-    "repetitive_questions"
-]
-
-BPSD_TIME_OF_DAY = ["morning", "afternoon", "evening", "night"]
-EXTERNAL_BOT_CHANNELS = {"telegram", "whatsapp"}
-EXTERNAL_BOT_ALLOWED_ROLES = {"caregiver", "clinician", "admin"}
-DOCTOR_BOT_INTENTS = {
-    "progress_summary",
-    "medications_today",
-    "missed_doses",
-    "safety_alerts",
-    "mood_behavior",
-    "today_instructions",
-    "compliance_check",
-    "full_report",
-    "add_medication",
-    "update_medication",
-    "deactivate_medication",
-    "add_care_instruction",
-    "log_patient_intake",
-    "unknown"
-}
-DOCTOR_BOT_WRITE_INTENTS = {
-    "add_medication", "update_medication", "deactivate_medication",
-    "add_care_instruction", "log_patient_intake"
-}
-
-# File upload security
-ALLOWED_MIME_TYPES = {
-    "image/jpeg", "image/png", "image/gif", "image/webp",
-    "audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4",
-    "video/mp4", "video/webm",
-    "application/pdf",
-}
-ALLOWED_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".gif", ".webp",
-    ".mp3", ".wav", ".webm", ".ogg", ".m4a",
-    ".mp4",
-    ".pdf",
-}
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
-
 def validate_upload(file: UploadFile, content: bytes):
     """Validate file type, extension, and size. Raises HTTPException on failure."""
     if len(content) > MAX_FILE_SIZE_BYTES:
@@ -301,39 +141,8 @@ def validate_upload(file: UploadFile, content: bytes):
 
 # ==================== HELPERS ====================
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def validate_password_strength(password: str):
-    """Enforce minimum password requirements."""
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
-    if not re.search(r'[A-Z]', password):
-        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter.")
-    if not re.search(r'\d', password):
-        raise HTTPException(status_code=400, detail="Password must contain at least one number.")
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    to_encode["iat"] = int(datetime.now(timezone.utc).timestamp())
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def create_refresh_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    return jwt.encode({"sub_refresh": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
-
 def parse_admin_bootstrap_emails() -> set:
-    raw = os.environ.get("ADMIN_BOOTSTRAP_EMAILS", "")
-    return {e.strip().lower() for e in raw.split(",") if e and e.strip()}
+    return {e.strip().lower() for e in ADMIN_BOOTSTRAP_EMAILS_RAW.split(",") if e and e.strip()}
 
 def is_bootstrap_admin_email(email: str) -> bool:
     return email.strip().lower() in parse_admin_bootstrap_emails()
@@ -2709,9 +2518,9 @@ async def dispatch_proactive_hooks(
     """
     recipients = await get_alert_recipients(patient_user_id)
     channels = [
-        ("push", os.environ.get("ALERT_PUSH_WEBHOOK_URL", "").strip()),
-        ("email", os.environ.get("ALERT_EMAIL_WEBHOOK_URL", "").strip()),
-        ("sms", os.environ.get("ALERT_SMS_WEBHOOK_URL", "").strip()),
+        ("push", ALERT_PUSH_WEBHOOK_URL),
+        ("email", ALERT_EMAIL_WEBHOOK_URL),
+        ("sms", ALERT_SMS_WEBHOOK_URL),
     ]
 
     envelope = {
@@ -3444,7 +3253,7 @@ async def billing_create_checkout(current_user: User = Depends(get_current_user)
     if not STRIPE_PRICE_ID:
         raise HTTPException(status_code=503, detail="Stripe price not configured")
 
-    frontend_url = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")[0].strip()
+    frontend_url = CORS_ORIGINS.split(",")[0].strip()
 
     # Find or create Stripe customer
     user_doc = await db.users.find_one({"user_id": current_user.user_id})
@@ -3482,7 +3291,7 @@ async def billing_create_portal(current_user: User = Depends(get_current_user)):
     if not stripe_cid:
         raise HTTPException(status_code=400, detail="No billing account found")
 
-    frontend_url = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")[0].strip()
+    frontend_url = CORS_ORIGINS.split(",")[0].strip()
     session = stripe_lib.billing_portal.Session.create(
         customer=stripe_cid,
         return_url=f"{frontend_url}/dashboard",
@@ -5902,7 +5711,7 @@ async def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "audio.ogg"
         return None
 
 async def download_telegram_file(file_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    token = TELEGRAM_BOT_TOKEN
     if not token:
         return None, None, None
     try:
@@ -5932,7 +5741,7 @@ async def download_telegram_voice_file(file_id: str) -> Tuple[Optional[bytes], O
 async def download_twilio_media(media_url: str) -> Tuple[Optional[bytes], Optional[str]]:
     if not media_url:
         return None, None
-    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    sid = TWILIO_SID
     token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
     auth = (sid, token) if sid and token else None
     try:
@@ -5947,7 +5756,7 @@ async def download_twilio_media(media_url: str) -> Tuple[Optional[bytes], Option
         return None, None
 
 async def send_telegram_text_message(chat_id: str, text: str) -> dict:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    token = TELEGRAM_BOT_TOKEN
     if not token:
         return {"sent": False, "reason": "telegram_token_missing"}
     try:
@@ -5970,7 +5779,7 @@ async def send_telegram_voice_message(chat_id: str, text: str) -> dict:
     If that fails or is unavailable we fall back to ``sendAudio`` which is
     format-agnostic and reliably delivers the audio file.
     """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    token = TELEGRAM_BOT_TOKEN
     if not token:
         return {"sent": False, "reason": "telegram_token_missing"}
     audio = await generate_tts_audio_bytes(text)
@@ -9454,11 +9263,6 @@ async def whatsapp_bot_webhook(request: Request):
 
 # ==================== PUSH NOTIFICATIONS + MEDICATION SCHEDULER ====================
 
-VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
-VAPID_CLAIMS = {"sub": f"mailto:{os.environ.get('VAPID_CONTACT_EMAIL', 'admin@alzahelp.com')}"}
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER", "")
-
 async def send_push_to_user(user_id: str, title: str, body: str, url: str = "/dashboard"):
     """Send web push notification to all subscriptions for a user."""
     if not VAPID_PRIVATE_KEY:
@@ -9538,7 +9342,7 @@ async def dispatch_emergency_contact_sms_fallback(
     severity: str,
     payload: dict
 ) -> List[dict]:
-    if os.environ.get("ALERT_SMS_WEBHOOK_URL", "").strip():
+    if ALERT_SMS_WEBHOOK_URL:
         return []
 
     normalized_event = (event_type or "").replace("_escalation", "")
@@ -9796,13 +9600,10 @@ async def health_check():
 # Include the router in the main app
 app.include_router(api_router)
 
-_cors_origins = os.environ.get('CORS_ORIGINS', '').strip()
-if not _cors_origins:
-    _cors_origins = "http://localhost:3000"
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=[o.strip() for o in _cors_origins.split(',') if o.strip()],
+    allow_origins=[o.strip() for o in CORS_ORIGINS.split(',') if o.strip()],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
