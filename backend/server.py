@@ -958,7 +958,16 @@ async def can_send_whatsapp_alert(recipient: dict, alert_doc: dict) -> tuple:
     """Returns (allowed, template_sid_or_none)."""
     if not recipient.get("whatsapp_opt_in"):
         return False, None
-    last_inbound = recipient.get("whatsapp_last_inbound_at")
+    # Check 24h session window from external_bot_users (where inbound timestamps are stored)
+    rid = recipient.get("user_id", recipient.get("id", ""))
+    if rid:
+        bot_user = await db.external_bot_users.find_one(
+            {"caregiver_user_id": rid, "platform": "whatsapp"},
+            {"whatsapp_last_inbound_at": 1}
+        )
+        last_inbound = (bot_user or {}).get("whatsapp_last_inbound_at")
+    else:
+        last_inbound = None
     if last_inbound:
         try:
             last_dt = datetime.fromisoformat(last_inbound.replace("Z", "+00:00"))
@@ -2649,7 +2658,7 @@ async def get_alert_recipients(patient_user_id: str) -> List[dict]:
     recipients = []
     patient = await db.users.find_one(
         {"user_id": patient_user_id},
-        {"_id": 0, "user_id": 1, "name": 1, "email": 1, "role": 1}
+        {"_id": 0, "user_id": 1, "name": 1, "email": 1, "role": 1, "phone": 1, "whatsapp_opt_in": 1, "telegram_chat_id": 1}
     )
     if patient:
         recipients.append(patient)
@@ -2662,7 +2671,7 @@ async def get_alert_recipients(patient_user_id: str) -> List[dict]:
     if caregiver_ids:
         caregivers = await db.users.find(
             {"user_id": {"$in": caregiver_ids}},
-            {"_id": 0, "user_id": 1, "name": 1, "email": 1, "role": 1}
+            {"_id": 0, "user_id": 1, "name": 1, "email": 1, "role": 1, "phone": 1, "whatsapp_opt_in": 1, "telegram_chat_id": 1}
         ).to_list(200)
         recipients.extend(caregivers)
 
