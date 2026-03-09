@@ -5956,7 +5956,9 @@ async def send_telegram_text_message(chat_id: str, text: str) -> dict:
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": text[:4000]}
             )
-        return {"sent": 200 <= resp.status_code < 300, "status_code": resp.status_code}
+        resp_data = resp.json() if resp.status_code == 200 else {}
+        message_id = resp_data.get("result", {}).get("message_id") if isinstance(resp_data, dict) else None
+        return {"sent": 200 <= resp.status_code < 300, "status_code": resp.status_code, "message_id": message_id}
     except Exception as exc:
         return {"sent": False, "reason": str(exc)[:240]}
 
