@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
@@ -11,6 +11,7 @@ from typing import List, Optional, Any, Tuple
 import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta, date
+from collections import defaultdict, deque
 import httpx
 import json
 import re
@@ -21,6 +22,7 @@ import secrets
 import hmac
 import hashlib
 import mimetypes
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -79,6 +81,9 @@ load_dotenv(ROOT_DIR / '.env')
 
 # Auth Configuration
 _jwt_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
+REQUIRE_JWT_SECRET = os.environ.get("REQUIRE_JWT_SECRET", "false").strip().lower() == "true"
+if REQUIRE_JWT_SECRET and not _jwt_secret:
+    raise RuntimeError("JWT_SECRET_KEY must be set when REQUIRE_JWT_SECRET=true")
 if not _jwt_secret:
     _jwt_secret = secrets.token_hex(32)
     logging.getLogger(__name__).warning("JWT_SECRET_KEY not set — generated ephemeral key. Tokens will not survive restarts.")
@@ -88,6 +93,47 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "lax")
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
+ENFORCE_HTTPS = os.environ.get("ENFORCE_HTTPS", "false").strip().lower() == "true"
+VOICE_CONFIRMATION_TTL_SECONDS = max(60, int(os.environ.get("VOICE_CONFIRMATION_TTL_SECONDS", "600") or "600"))
+
+# ── Notification delivery queue ──
+NOTIFICATION_MAX_ATTEMPTS = int(os.environ.get("NOTIFICATION_MAX_ATTEMPTS", "5"))
+NOTIFICATION_BACKOFF_BASE_SECONDS = int(os.environ.get("NOTIFICATION_BACKOFF_BASE_SECONDS", "30"))
+NOTIFICATION_BACKOFF_MAX_SECONDS = int(os.environ.get("NOTIFICATION_BACKOFF_MAX_SECONDS", "1800"))
+NOTIFICATION_LEASE_SECONDS = 60
+
+CHANNEL_DISPATCH_POLICY = {
+    "critical": {
+        "immediate": ["push", "sms", "telegram"],
+        "if_policy_allows": ["whatsapp"],
+    },
+    "high": {
+        "immediate": ["push", "telegram"],
+        "on_escalation": ["sms"],
+        "if_policy_allows": ["whatsapp"],
+    },
+    "medium": {
+        "immediate": ["push", "telegram"],
+        "on_escalation_threshold": {"sms": 2},
+    },
+    "low": {
+        "immediate": ["push"],
+        "if_linked": ["telegram"],
+    },
+}
+
+WHATSAPP_ALERT_TEMPLATES = {
+    "sos_trigger": os.environ.get("TWILIO_WA_TEMPLATE_SOS", "").strip() or None,
+    "fall_detected": os.environ.get("TWILIO_WA_TEMPLATE_FALL", "").strip() or None,
+    "geofence_exit": os.environ.get("TWILIO_WA_TEMPLATE_GEOFENCE", "").strip() or None,
+    "missed_medication_dose": os.environ.get("TWILIO_WA_TEMPLATE_MISSED_MED", "").strip() or None,
+}
+
+TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+
+WRITE_RATE_LIMIT_ENABLED = os.environ.get("WRITE_RATE_LIMIT_ENABLED", "true").strip().lower() == "true"
+WRITE_RATE_LIMIT_WINDOW_SECONDS = max(10, int(os.environ.get("WRITE_RATE_LIMIT_WINDOW_SECONDS", "60") or "60"))
+WRITE_RATE_LIMIT_MAX_REQUESTS = max(10, int(os.environ.get("WRITE_RATE_LIMIT_MAX_REQUESTS", "120") or "120"))
 
 # Password hashing configuration
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -121,6 +167,22 @@ app = FastAPI(title="AlzaHelp API", version="1.0.0")
 background_scheduler = None
 _nominatim_lock = asyncio.Lock()
 _last_nominatim_request_at = 0.0
+_write_request_buckets = defaultdict(deque)
+
+WRITE_RATE_LIMIT_EXEMPT_PREFIXES = (
+    "/health",
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/refresh",
+    "/api/auth/logout",
+    "/api/auth/demo",
+    "/api/voice-command",
+    "/api/voice/transcribe",
+    "/api/tts",
+    "/api/safety/location-ping",
+    "/api/safety/escalations/run",
+    "/api/webhooks/",
+)
 
 # Rate limiting
 if _HAS_SLOWAPI:
@@ -408,6 +470,399 @@ def join_voice_items(items: List[str]) -> str:
     if len(cleaned) == 2:
         return f"{cleaned[0]} and {cleaned[1]}"
     return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+def classify_voice_confirmation_reply(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return "unknown"
+
+    affirmative_phrases = [
+        "yes", "yeah", "yep", "please do", "go ahead", "do it",
+        "that's right", "that is right", "correct", "confirm",
+        "record it", "log it", "mark it", "sounds right", "okay yes"
+    ]
+    negative_phrases = [
+        "no", "nope", "nah", "cancel", "don't", "do not",
+        "not yet", "wrong one", "that's wrong", "that is wrong",
+        "stop", "never mind", "nevermind"
+    ]
+
+    if lowered in affirmative_phrases or any(re.search(rf"\b{re.escape(phrase)}\b", lowered) for phrase in affirmative_phrases):
+        return "affirmative"
+    if lowered in negative_phrases or any(re.search(rf"\b{re.escape(phrase)}\b", lowered) for phrase in negative_phrases):
+        return "negative"
+    return "unknown"
+
+def parse_voice_slot_datetime(slot: dict) -> Optional[datetime]:
+    sched_str = slot.get("scheduled_for")
+    if not sched_str:
+        return None
+    try:
+        sched_dt = datetime.fromisoformat(str(sched_str).replace("Z", "+00:00"))
+        if sched_dt.tzinfo is None:
+            sched_dt = sched_dt.replace(tzinfo=timezone.utc)
+        return sched_dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def build_voice_slot_option(slot: dict, med_names: dict, index: int) -> dict:
+    med_id = slot.get("medication_id", "")
+    name, dosage = med_names.get(med_id, ("medication", ""))
+    sched_dt = parse_voice_slot_datetime(slot)
+    scheduled_for = sched_dt.isoformat() if sched_dt else None
+    time_hhmm = f"{sched_dt.hour:02d}:{sched_dt.minute:02d}" if sched_dt else None
+    label = f"{name} {dosage}".replace("  ", " ").strip()
+    if time_hhmm:
+        label = f"{label} at {format_hhmm_for_voice(time_hhmm)}".strip()
+    return {
+        "index": index,
+        "medication_id": med_id,
+        "name": name,
+        "dosage": dosage,
+        "label": label or "medication",
+        "scheduled_for": scheduled_for,
+        "scheduled_time": time_hhmm,
+    }
+
+def match_voice_slot_option(spoken_text: str, options: List[dict]) -> Optional[dict]:
+    lowered = (spoken_text or "").strip().lower()
+    if not lowered:
+        return None
+
+    ordinal_map = {
+        "first": 0, "1": 0, "one": 0,
+        "second": 1, "2": 1, "two": 1,
+        "third": 2, "3": 2, "three": 2,
+        "fourth": 3, "4": 3, "four": 3,
+    }
+    for token, idx in ordinal_map.items():
+        if re.search(rf"\b{re.escape(token)}\b", lowered) and idx < len(options):
+            return options[idx]
+
+    matched = None
+    for option in options:
+        name_lower = (option.get("name") or "").lower()
+        dosage_lower = (option.get("dosage") or "").lower()
+        if name_lower and name_lower in lowered:
+            return option
+        for word in name_lower.split():
+            if len(word) > 3 and re.search(rf"\b{re.escape(word)}\b", lowered):
+                return option
+        scheduled_time = option.get("scheduled_time")
+        if scheduled_time and (
+            scheduled_time in lowered
+            or format_hhmm_for_voice(scheduled_time).lower() in lowered
+        ):
+            matched = option
+        if dosage_lower and dosage_lower in lowered:
+            matched = option
+    return matched
+
+async def store_pending_voice_action(
+    owner_id: str,
+    *,
+    stage: str,
+    options: List[dict],
+    source_text: str,
+    session_id: Optional[str] = None,
+    selected_option: Optional[dict] = None,
+) -> None:
+    now_utc = datetime.now(timezone.utc)
+    await db.voice_pending_actions.update_one(
+        {"user_id": owner_id, "kind": "medication_intake"},
+        {
+            "$set": {
+                "user_id": owner_id,
+                "kind": "medication_intake",
+                "stage": stage,
+                "session_id": session_id,
+                "options": options,
+                "selected_option": selected_option,
+                "source_text": source_text,
+                "updated_at": now_utc,
+                "expires_at": now_utc + timedelta(seconds=VOICE_CONFIRMATION_TTL_SECONDS),
+            },
+            "$setOnInsert": {
+                "created_at": now_utc,
+            },
+        },
+        upsert=True,
+    )
+
+async def clear_pending_voice_action(owner_id: str) -> None:
+    await db.voice_pending_actions.delete_many({"user_id": owner_id, "kind": "medication_intake"})
+
+
+# ── Notification delivery queue helpers ──
+
+def compute_next_retry_at(attempt: int) -> str:
+    delay = min(
+        NOTIFICATION_BACKOFF_BASE_SECONDS * (2 ** attempt),
+        NOTIFICATION_BACKOFF_MAX_SECONDS
+    )
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+
+
+def classify_delivery_failure(channel: str, error: Exception, status_code: int = 0) -> str:
+    """Return 'transient' or 'permanent'."""
+    error_msg = str(error).lower() if error else ""
+    # Transient: network issues, server errors, rate limits
+    if status_code in TRANSIENT_HTTP_CODES:
+        return "transient"
+    if any(t in error_msg for t in ["timeout", "connection", "dns", "temporary"]):
+        return "transient"
+    # Twilio permanent errors
+    if "21211" in error_msg or "21614" in error_msg or "21608" in error_msg:
+        return "permanent"
+    # HTTP 4xx (except 429) = permanent
+    if 400 <= status_code < 500 and status_code != 429:
+        return "permanent"
+    # Default to transient (safer to retry)
+    return "transient"
+
+
+async def enqueue_delivery_job(
+    alert_doc: dict,
+    recipient: dict,
+    channel: str,
+    address: str,
+    template_sid: str = None,
+) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    job = {
+        "id": f"ndq_{uuid.uuid4().hex[:12]}",
+        "alert_id": alert_doc.get("id", ""),
+        "recipient_id": recipient.get("user_id", recipient.get("id", "")),
+        "recipient_name": recipient.get("name", ""),
+        "channel": channel,
+        "channel_address": address,
+        "status": "pending",
+        "attempts": 0,
+        "max_attempts": NOTIFICATION_MAX_ATTEMPTS,
+        "next_retry_at": now_iso,
+        "last_attempt_at": None,
+        "last_error": None,
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "provider": None,
+        "provider_message_id": None,
+        "terminal_failure_reason": None,
+        "alert_active_at_send": True,
+        "template_sid": template_sid,
+        "payload": {
+            "title": f"AlzaHelp Safety Alert",
+            "body": alert_doc.get("message", "Safety alert triggered"),
+            "event_type": alert_doc.get("event_type", "alert"),
+            "severity": alert_doc.get("severity", "medium"),
+            "patient_name": alert_doc.get("patient_name", ""),
+            "location_url": alert_doc.get("location_url", ""),
+        },
+        "dispatch_policy_channel_reason": channel,
+        "created_at": now_iso,
+        "delivered_at": None,
+        "failed_at": None,
+    }
+    await db.notification_delivery_queue.insert_one(job)
+    return job
+
+
+async def cancel_pending_notifications_for_alert(alert_id: str):
+    if not alert_id:
+        return 0
+    result = await db.notification_delivery_queue.update_many(
+        {
+            "alert_id": alert_id,
+            "status": {"$in": ["pending", "failed_transient"]}
+        },
+        {
+            "$set": {
+                "status": "cancelled",
+                "terminal_failure_reason": "alert_acknowledged",
+            }
+        },
+    )
+    return result.modified_count
+
+
+async def log_voice_medication_intake(owner_id: str, option: dict) -> dict:
+    now_utc = datetime.now(timezone.utc)
+    med_id = option.get("medication_id") or ""
+    name = option.get("name") or "your medication"
+    dosage = option.get("dosage") or ""
+    label = f"{name} {dosage}".replace("  ", " ").strip()
+    scheduled_for = parse_iso_to_utc(option.get("scheduled_for"))
+    scheduled_for_iso = scheduled_for.isoformat() if scheduled_for else None
+
+    duplicate_query = {
+        "user_id": owner_id,
+        "medication_id": med_id,
+        "status": "taken",
+    }
+    if scheduled_for_iso:
+        duplicate_query["scheduled_for"] = scheduled_for_iso
+    existing = await db.medication_intake_logs.find_one(duplicate_query, {"_id": 0, "confirmed_at": 1})
+    if existing:
+        when = format_datetime_for_voice(scheduled_for) if scheduled_for else "today"
+        return {
+            "action": "speak",
+            "response": f"I already have {label} recorded as taken for {when}. I won't log it again."
+        }
+
+    delay_minutes = None
+    if scheduled_for:
+        delay_minutes = int(round((now_utc - scheduled_for).total_seconds() / 60))
+
+    log_obj = MedicationIntakeLog(
+        user_id=owner_id,
+        medication_id=med_id,
+        status="taken",
+        scheduled_for=scheduled_for,
+        source="voice",
+        notes="Logged via voice assistant",
+        recorded_by_user_id=owner_id,
+        delay_minutes=delay_minutes,
+        confirmed_at=now_utc
+    )
+    doc = log_obj.model_dump()
+    doc["confirmed_at"] = doc["confirmed_at"].isoformat()
+    if doc.get("scheduled_for"):
+        doc["scheduled_for"] = doc["scheduled_for"].isoformat()
+    await db.medication_intake_logs.insert_one(doc)
+
+    if doc.get("scheduled_for"):
+        await db.medication_missed_alerts.delete_many({
+            "user_id": owner_id,
+            "medication_id": med_id,
+            "scheduled_for": doc["scheduled_for"]
+        })
+        await db.safety_alerts.update_many(
+            {
+                "user_id": owner_id,
+                "event_type": "missed_medication_dose",
+                "acknowledged": False,
+                "medication_id": med_id,
+                "scheduled_for": doc["scheduled_for"]
+            },
+            {
+                "$set": {
+                    "acknowledged": True,
+                    "acknowledged_at": now_utc.isoformat(),
+                    "acknowledged_by_user_id": owner_id,
+                    "escalation_status": "resolved_after_intake",
+                    "escalation_next_at": None
+                }
+            }
+        )
+
+    remaining_pending = await _build_medication_mar_for_period(
+        owner_id,
+        now_utc.replace(hour=0, minute=0, second=0, microsecond=0),
+        now_utc.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+    )
+    remaining_slots = []
+    for slot in remaining_pending.get("slots", []):
+        status = slot.get("status")
+        if status not in {"due", "overdue", "upcoming"}:
+            continue
+        if status == "upcoming":
+            slot_dt = parse_voice_slot_datetime(slot)
+            if slot_dt and (slot_dt - now_utc).total_seconds() > 7200:
+                continue
+        remaining_slots.append(slot)
+    remaining = len(remaining_slots)
+    if remaining > 0:
+        return {
+            "action": "speak",
+            "response": f"Got it. I recorded {label} as taken. You still have {remaining} more dose{'s' if remaining != 1 else ''} scheduled for today."
+        }
+    return {
+        "action": "speak",
+        "response": f"Got it. I recorded {label} as taken. That's all your medication for now."
+    }
+
+async def handle_pending_voice_action(owner_id: str, spoken_text: str, session_id: Optional[str] = None) -> Optional[dict]:
+    pending = await db.voice_pending_actions.find_one(
+        {"user_id": owner_id, "kind": "medication_intake"},
+        {"_id": 0}
+    )
+    if not pending:
+        return None
+
+    expires_at = pending.get("expires_at")
+    if isinstance(expires_at, datetime):
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            await clear_pending_voice_action(owner_id)
+            if classify_voice_confirmation_reply(spoken_text) != "unknown":
+                return {
+                    "action": "speak",
+                    "response": "That medication confirmation expired. Please tell me again which dose you took."
+                }
+            return None
+
+    decision = classify_voice_confirmation_reply(spoken_text)
+    stage = pending.get("stage")
+    options = pending.get("options") or []
+
+    if stage == "selection":
+        if decision == "negative":
+            await clear_pending_voice_action(owner_id)
+            return {
+                "action": "speak",
+                "response": "Okay. I did not record any medication."
+            }
+        matched_option = match_voice_slot_option(spoken_text, options)
+        if not matched_option:
+            if decision == "affirmative":
+                listing = join_voice_items([opt.get("label", "medication") for opt in options[:5]])
+                return {
+                    "action": "speak",
+                    "response": f"Please tell me which medication you took: {listing}."
+                }
+            return None
+        await store_pending_voice_action(
+            owner_id,
+            stage="confirmation",
+            options=options,
+            source_text=pending.get("source_text") or spoken_text,
+            session_id=session_id or pending.get("session_id"),
+            selected_option=matched_option,
+        )
+        return {
+            "action": "speak",
+            "response": f"I heard {matched_option.get('label', 'that medication')}. Should I record it as taken now? Please say yes or no."
+        }
+
+    if stage == "confirmation":
+        selected_option = pending.get("selected_option") or {}
+        if decision == "negative":
+            await clear_pending_voice_action(owner_id)
+            return {
+                "action": "speak",
+                "response": "Okay. I did not record that medication."
+            }
+        if decision == "affirmative":
+            await clear_pending_voice_action(owner_id)
+            return await log_voice_medication_intake(owner_id, selected_option)
+        replacement = match_voice_slot_option(spoken_text, options)
+        if replacement:
+            await store_pending_voice_action(
+                owner_id,
+                stage="confirmation",
+                options=options,
+                source_text=pending.get("source_text") or spoken_text,
+                session_id=session_id or pending.get("session_id"),
+                selected_option=replacement,
+            )
+            return {
+                "action": "speak",
+                "response": f"I heard {replacement.get('label', 'that medication')}. Should I record it as taken now? Please say yes or no."
+            }
+        return None
+
+    await clear_pending_voice_action(owner_id)
+    return None
 
 def is_medication_schedule_question(text: str) -> bool:
     lowered = (text or "").strip().lower()
@@ -2114,30 +2569,34 @@ async def process_all_due_alert_escalations(
     max_alerts_per_user: int = 20
 ) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
-    due_query = {
-        "acknowledged": False,
-        "escalation_status": "active",
-        "escalation_next_at": {"$lte": now_iso}
-    }
-    user_ids = await db.safety_alerts.distinct("user_id", due_query)
-    processed_users = []
-    processed_alerts = 0
-    for user_id in user_ids[:max_users]:
-        result = await process_due_alert_escalations(
-            user_id,
-            max_alerts=max_alerts_per_user,
-            trigger_source="scheduler"
-        )
-        count = int(result.get("processed_count", 0))
-        if count > 0:
-            processed_users.append({"user_id": user_id, "processed_count": count})
-            processed_alerts += count
-    return {
-        "processed_user_count": len(processed_users),
-        "processed_alert_count": processed_alerts,
-        "processed_users": processed_users,
-        "run_at": now_iso
-    }
+    try:
+        due_query = {
+            "acknowledged": False,
+            "escalation_status": "active",
+            "escalation_next_at": {"$lte": now_iso}
+        }
+        user_ids = await db.safety_alerts.distinct("user_id", due_query)
+        processed_users = []
+        processed_alerts = 0
+        for user_id in user_ids[:max_users]:
+            result = await process_due_alert_escalations(
+                user_id,
+                max_alerts=max_alerts_per_user,
+                trigger_source="scheduler"
+            )
+            count = int(result.get("processed_count", 0))
+            if count > 0:
+                processed_users.append({"user_id": user_id, "processed_count": count})
+                processed_alerts += count
+        return {
+            "processed_user_count": len(processed_users),
+            "processed_alert_count": processed_alerts,
+            "processed_users": processed_users,
+            "run_at": now_iso
+        }
+    except Exception as e:
+        logger.error("Safety escalation sweep failed: %s", e)
+        return {"processed_user_count": 0, "processed_alert_count": 0, "error": str(e), "run_at": now_iso}
 
 async def log_admin_audit(
     admin_user: User,
@@ -4286,7 +4745,7 @@ async def build_today_medication_voice_response(owner_id: str) -> str:
     return f"{intro} {detail} {next_line}"
 
 
-async def handle_voice_medication_intake(owner_id: str, spoken_text: str) -> dict:
+async def handle_voice_medication_intake(owner_id: str, spoken_text: str, session_id: Optional[str] = None) -> dict:
     """
     Handle a patient reporting they took their medication via voice.
     Returns dict with action and response for the voice assistant.
@@ -4323,119 +4782,57 @@ async def handle_voice_medication_intake(owner_id: str, spoken_text: str) -> dic
 
     # Try to match a specific medication name from the spoken text
     lowered = (spoken_text or "").lower()
-    matched_slot = None
+    matched_option = None
 
     # Build a name lookup from medications
     med_names = {}
     for med in medications:
         med_names[med.get("id", "")] = (med.get("name", ""), med.get("dosage", ""))
 
-    for slot in pending:
-        med_id = slot.get("medication_id", "")
-        name, dosage = med_names.get(med_id, ("", ""))
-        name_lower = name.lower()
-        # Check if medication name appears in spoken text
-        if name_lower and name_lower in lowered:
-            matched_slot = slot
-            break
-        # Also check individual words of the name (e.g., "metformin" from "Metformin 500mg")
-        for word in name_lower.split():
-            if len(word) > 3 and word in lowered:
-                matched_slot = slot
-                break
-        if matched_slot:
-            break
+    pending_options = [build_voice_slot_option(slot, med_names, index) for index, slot in enumerate(pending)]
 
-    # If exactly 1 pending dose or we matched one, log it
-    target_slot = matched_slot or (pending[0] if len(pending) == 1 else None)
+    matched_option = match_voice_slot_option(spoken_text, pending_options)
 
-    if not target_slot and len(pending) > 1:
-        # Ask patient which medication
-        names = []
-        for slot in pending[:5]:
-            med_id = slot.get("medication_id", "")
-            name, dosage = med_names.get(med_id, ("medication", ""))
-            label = f"{name} {dosage}".strip() if dosage else name
-            names.append(label)
-        listing = join_voice_items(names)
+    if not matched_option and len(pending_options) > 1:
+        listing = join_voice_items([option.get("label", "medication") for option in pending_options[:5]])
+        await store_pending_voice_action(
+            owner_id,
+            stage="selection",
+            options=pending_options,
+            source_text=spoken_text,
+            session_id=session_id,
+        )
         return {
             "action": "speak",
             "response": f"I see you have {len(pending)} doses pending: {listing}. Which one did you take?"
         }
 
-    # Log the intake
-    med_id = target_slot["medication_id"]
-    name, dosage = med_names.get(med_id, ("your medication", ""))
-    label = f"{name} {dosage}".strip() if dosage else name
-
-    scheduled_for = None
-    if target_slot.get("scheduled_for"):
-        try:
-            scheduled_for = datetime.fromisoformat(
-                target_slot["scheduled_for"].replace("Z", "+00:00")
-            )
-            if scheduled_for.tzinfo is None:
-                scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
-            scheduled_for = scheduled_for.astimezone(timezone.utc)
-        except Exception:
-            scheduled_for = None
-
-    delay_minutes = None
-    if scheduled_for:
-        delay_minutes = int(round((now_utc - scheduled_for).total_seconds() / 60))
-
-    log_obj = MedicationIntakeLog(
-        user_id=owner_id,
-        medication_id=med_id,
-        status="taken",
-        scheduled_for=scheduled_for,
-        source="voice",
-        notes="Logged via voice assistant",
-        recorded_by_user_id=owner_id,
-        delay_minutes=delay_minutes,
-        confirmed_at=now_utc
-    )
-    doc = log_obj.model_dump()
-    doc["confirmed_at"] = doc["confirmed_at"].isoformat()
-    if doc.get("scheduled_for"):
-        doc["scheduled_for"] = doc["scheduled_for"].isoformat()
-    await db.medication_intake_logs.insert_one(doc)
-
-    # Resolve missed-dose alerts
-    if doc.get("scheduled_for"):
-        await db.medication_missed_alerts.delete_many({
-            "user_id": owner_id,
-            "medication_id": med_id,
-            "scheduled_for": doc["scheduled_for"]
-        })
-        await db.safety_alerts.update_many(
-            {
-                "user_id": owner_id,
-                "event_type": "missed_medication_dose",
-                "acknowledged": False,
-                "medication_id": med_id,
-                "scheduled_for": doc["scheduled_for"]
-            },
-            {
-                "$set": {
-                    "acknowledged": True,
-                    "acknowledged_at": now_utc.isoformat(),
-                    "acknowledged_by_user_id": owner_id,
-                    "escalation_status": "resolved_after_intake",
-                    "escalation_next_at": None
-                }
-            }
+    target_option = matched_option or (pending_options[0] if len(pending_options) == 1 else None)
+    if not target_option:
+        await store_pending_voice_action(
+            owner_id,
+            stage="selection",
+            options=pending_options,
+            source_text=spoken_text,
+            session_id=session_id,
         )
-
-    remaining = len(pending) - 1
-    if remaining > 0:
+        listing = join_voice_items([option.get("label", "medication") for option in pending_options[:5]])
         return {
             "action": "speak",
-            "response": f"Got it! I've recorded that you took {label}. You still have {remaining} more dose{'s' if remaining > 1 else ''} scheduled for today."
+            "response": f"I need the medication name before I record anything. You still have {listing} pending."
         }
+
+    await store_pending_voice_action(
+        owner_id,
+        stage="confirmation",
+        options=pending_options,
+        source_text=spoken_text,
+        session_id=session_id,
+        selected_option=target_option,
+    )
     return {
         "action": "speak",
-        "response": f"Got it! I've recorded that you took {label}. That's all your medication for now. Well done!"
+        "response": f"I heard {target_option.get('label', 'that medication')}. Should I record it as taken now? Please say yes or no."
     }
 
 
@@ -5284,8 +5681,10 @@ async def parse_medication_from_text(text: str) -> dict:
     """Use LLM to extract medication details from natural language."""
     if not os.environ.get("OPENAI_API_KEY"):
         return {}
+    today_iso = datetime.now(timezone.utc).date().isoformat()
     prompt = (
         "Extract medication prescription details from the doctor's message.\n"
+        f"Today is {today_iso}.\n"
         "Return strict JSON:\n"
         "{\n"
         '  "name": "medication name",\n'
@@ -5294,7 +5693,9 @@ async def parse_medication_from_text(text: str) -> dict:
         '  "times_per_day": 1,\n'
         '  "scheduled_times": ["HH:MM", ...],\n'
         '  "instructions": "optional special instructions",\n'
-        '  "prescribing_doctor": "doctor name if mentioned"\n'
+        '  "prescribing_doctor": "doctor name if mentioned",\n'
+        '  "start_date": "YYYY-MM-DD or null",\n'
+        '  "end_date": "YYYY-MM-DD or null"\n'
         "}\n"
         "For frequency mapping:\n"
         "- once a day / daily → daily, times_per_day=1\n"
@@ -5304,6 +5705,9 @@ async def parse_medication_from_text(text: str) -> dict:
         "- weekly / once a week → weekly\n"
         "Convert times like '8am' to '08:00', '8pm' to '20:00'.\n"
         "If no times specified, use reasonable defaults based on frequency.\n"
+        f"If no start date is mentioned, use {today_iso}.\n"
+        "If the message includes a duration like 'for 10 days', convert it into an end_date.\n"
+        "If no end date or duration is provided, return null for end_date.\n"
     )
     try:
         client = get_openai_client()
@@ -5534,6 +5938,15 @@ async def handle_bot_add_medication(
     times_per_day = int(parsed.get("times_per_day", 1))
     scheduled_times = parsed.get("scheduled_times", [])
     cleaned_times = [normalize_hhmm(t) for t in scheduled_times if t]
+    start_date = normalize_yyyy_mm_dd(parsed.get("start_date")) or datetime.now(timezone.utc).date().isoformat()
+    end_date = normalize_yyyy_mm_dd(parsed.get("end_date"))
+    if not end_date:
+        return (
+            "For safety, bot-created medications need an end date or review date. "
+            "Please specify it, for example: 'Add medication Metformin 500mg twice daily at 8am and 8pm until 2026-04-30'."
+        )
+    if end_date < start_date:
+        return "The medication end date cannot be before the start date. Please correct the dates and try again."
 
     med_obj = Medication(
         user_id=owner_id,
@@ -5543,7 +5956,9 @@ async def handle_bot_add_medication(
         times_per_day=times_per_day,
         scheduled_times=cleaned_times,
         prescribing_doctor=parsed.get("prescribing_doctor") or doctor_user.name,
-        instructions=parsed.get("instructions")
+        instructions=parsed.get("instructions"),
+        start_date=start_date,
+        end_date=end_date,
     )
     doc = med_obj.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
@@ -5563,6 +5978,7 @@ async def handle_bot_add_medication(
         f"- Dosage: {dosage or 'as prescribed'}\n"
         f"- Frequency: {frequency.replace('_', ' ')}\n"
         f"- Scheduled times: {times_str}\n"
+        f"- Active dates: {start_date} to {end_date}\n"
         f"- Prescribed by: {med_obj.prescribing_doctor or 'N/A'}"
     )
 
@@ -5675,7 +6091,11 @@ async def handle_bot_deactivate_medication(
 
     await db.medications.update_one(
         {"id": matched["id"], "user_id": owner_id},
-        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {
+            "active": False,
+            "end_date": matched.get("end_date") or datetime.now(timezone.utc).date().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
     )
     return f"Deactivated medication: {matched.get('name', '')} ({matched.get('dosage', '')})"
 
@@ -5781,9 +6201,24 @@ async def handle_bot_update_medication(
         update_fields["times_per_day"] = int(parsed["times_per_day"])
     if parsed.get("instructions"):
         update_fields["instructions"] = parsed["instructions"]
+    if parsed.get("start_date"):
+        normalized_start = normalize_yyyy_mm_dd(parsed.get("start_date"))
+        if not normalized_start:
+            return "The medication start date must use YYYY-MM-DD."
+        update_fields["start_date"] = normalized_start
+    if parsed.get("end_date"):
+        normalized_end = normalize_yyyy_mm_dd(parsed.get("end_date"))
+        if not normalized_end:
+            return "The medication end date must use YYYY-MM-DD."
+        update_fields["end_date"] = normalized_end
 
     if not update_fields:
         return f"Could not determine what to change for {matched.get('name', '')}. Please specify, e.g.: 'Update metformin dosage to 1000mg'"
+
+    effective_start = update_fields.get("start_date", matched.get("start_date"))
+    effective_end = update_fields.get("end_date", matched.get("end_date"))
+    if effective_start and effective_end and effective_end < effective_start:
+        return "The medication end date cannot be before the start date."
 
     update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.medications.update_one(
@@ -6103,9 +6538,22 @@ async def create_medication(
     guard_demo_write(current_user)
     owner_id = await resolve_target_user_id(current_user, target_user_id, require_write=True)
     cleaned_times = [normalize_hhmm(t) for t in medication.scheduled_times if t]
+    start_date = normalize_yyyy_mm_dd(medication.start_date)
+    end_date = normalize_yyyy_mm_dd(medication.end_date)
+    if medication.start_date and not start_date:
+        raise HTTPException(status_code=400, detail="start_date must use YYYY-MM-DD")
+    if medication.end_date and not end_date:
+        raise HTTPException(status_code=400, detail="end_date must use YYYY-MM-DD")
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
     med_obj = Medication(
         user_id=owner_id,
-        **{**medication.model_dump(), "scheduled_times": cleaned_times}
+        **{
+            **medication.model_dump(),
+            "scheduled_times": cleaned_times,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
     )
     doc = med_obj.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
@@ -6132,6 +6580,25 @@ async def update_medication(
     update_data = {k: v for k, v in medication.model_dump().items() if v is not None}
     if "scheduled_times" in update_data:
         update_data["scheduled_times"] = [normalize_hhmm(t) for t in update_data["scheduled_times"] if t]
+    if "start_date" in update_data:
+        normalized_start = normalize_yyyy_mm_dd(update_data["start_date"])
+        if update_data["start_date"] and not normalized_start:
+            raise HTTPException(status_code=400, detail="start_date must use YYYY-MM-DD")
+        update_data["start_date"] = normalized_start
+    if "end_date" in update_data:
+        normalized_end = normalize_yyyy_mm_dd(update_data["end_date"])
+        if update_data["end_date"] and not normalized_end:
+            raise HTTPException(status_code=400, detail="end_date must use YYYY-MM-DD")
+        update_data["end_date"] = normalized_end
+
+    if "start_date" in update_data or "end_date" in update_data:
+        existing = await db.medications.find_one({"id": medication_id, "user_id": owner_id}, {"_id": 0, "start_date": 1, "end_date": 1})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Medication not found")
+        effective_start = update_data.get("start_date", existing.get("start_date"))
+        effective_end = update_data.get("end_date", existing.get("end_date"))
+        if effective_start and effective_end and effective_end < effective_start:
+            raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.medications.update_one(
         {"id": medication_id, "user_id": owner_id},
@@ -8254,6 +8721,10 @@ async def process_voice_command(
             "response": "Opening Safety now. Press the SOS button and I will help notify your caregiver right away."
         }
 
+    pending_voice_response = await handle_pending_voice_action(current_user.user_id, command.text, command.session_id)
+    if pending_voice_response is not None:
+        return pending_voice_response
+
     chess_query = "chess" in text and any(term in text for term in ["play", "game", "quiz", "practice"])
     medication_taken_report = is_medication_taken_report(text)
     medication_schedule_query = is_medication_schedule_question(text)
@@ -8294,7 +8765,7 @@ async def process_voice_command(
     # Medication taken report (voice intake logging)
     if medication_taken_report or special_intent == "medication_taken":
         try:
-            return await handle_voice_medication_intake(current_user.user_id, command.text)
+            return await handle_voice_medication_intake(current_user.user_id, command.text, command.session_id)
         except Exception as e:
             logger.error(f"Voice medication intake error: {e}")
             return {
@@ -8834,8 +9305,33 @@ async def ensure_indexes():
     # Instruction chunks (for RAG)
     await db.care_instruction_chunks.create_index([("user_id", 1), ("instruction_id", 1)])
 
+    # Pending voice actions
+    await db.voice_pending_actions.create_index([("user_id", 1), ("kind", 1)], unique=True)
+    await db.voice_pending_actions.create_index("expires_at", expireAfterSeconds=0)
+
     # AI usage counters - TTL auto-cleanup after 7 days
     await db.ai_usage.create_index("date", expireAfterSeconds=86400 * 7)
+
+    # Notification delivery queue
+    await db.notification_delivery_queue.create_index(
+        [("status", 1), ("next_retry_at", 1)],
+        name="ndq_sweep"
+    )
+    await db.notification_delivery_queue.create_index("alert_id", name="ndq_alert")
+    await db.notification_delivery_queue.create_index(
+        [("recipient_id", 1), ("channel", 1), ("alert_id", 1)],
+        name="ndq_dedup"
+    )
+    await db.notification_delivery_queue.create_index(
+        "lease_expires_at",
+        name="ndq_lease_recovery",
+        sparse=True
+    )
+    await db.notification_delivery_queue.create_index(
+        "created_at",
+        expireAfterSeconds=86400 * 30,
+        name="ndq_ttl"
+    )
 
     logger.info("MongoDB indexes ensured")
 
@@ -8896,6 +9392,52 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+def request_is_secure(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    if forwarded_proto:
+        first_proto = forwarded_proto.split(",")[0].strip().lower()
+        if first_proto == "https":
+            return True
+    return False
+
+def write_rate_limit_key(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        first_ip = forwarded_for.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+    client_host = getattr(request.client, "host", None)
+    return client_host or "unknown"
+
+@app.middleware("http")
+async def enforce_transport_and_write_limits(request: Request, call_next):
+    path = request.url.path or "/"
+    host = (request.url.hostname or "").strip().lower()
+    is_local_host = host in {"localhost", "127.0.0.1", "0.0.0.0"}
+    if ENFORCE_HTTPS and path != "/health" and not is_local_host and not request_is_secure(request):
+        return JSONResponse(status_code=426, content={"detail": "HTTPS is required."})
+
+    if (
+        WRITE_RATE_LIMIT_ENABLED
+        and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and not any(path.startswith(prefix) for prefix in WRITE_RATE_LIMIT_EXEMPT_PREFIXES)
+    ):
+        bucket_key = write_rate_limit_key(request)
+        bucket = _write_request_buckets[bucket_key]
+        now_tick = time.monotonic()
+        while bucket and (now_tick - bucket[0]) > WRITE_RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= WRITE_RATE_LIMIT_MAX_REQUESTS:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many write requests. Please slow down and try again shortly."}
+            )
+        bucket.append(now_tick)
+
+    return await call_next(request)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
