@@ -813,6 +813,147 @@ CHANNEL_HANDLERS = {
 }
 
 
+async def process_notification_delivery_queue(batch_size: int = 50):
+    """Sweep due notification jobs. Called by APScheduler every 30s."""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        worker_id = f"w_{uuid.uuid4().hex[:8]}"
+
+        # 1. Recover stuck in_flight jobs (lease expired)
+        await db.notification_delivery_queue.update_many(
+            {
+                "status": "in_flight",
+                "lease_expires_at": {"$lte": now_iso},
+            },
+            {
+                "$set": {
+                    "status": "failed_transient",
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": "lease_expired",
+                }
+            },
+        )
+
+        # 2. Find due jobs
+        due_jobs = await db.notification_delivery_queue.find(
+            {
+                "status": {"$in": ["pending", "failed_transient"]},
+                "next_retry_at": {"$lte": now_iso},
+            },
+            {"_id": 0},
+        ).sort("next_retry_at", 1).to_list(batch_size)
+
+        processed = 0
+        for job in due_jobs:
+            job_id = job["id"]
+            alert_id = job.get("alert_id", "")
+
+            # 2a. Check if alert is still active
+            if alert_id:
+                alert = await db.safety_alerts.find_one(
+                    {"id": alert_id}, {"acknowledged": 1}
+                )
+                if alert and alert.get("acknowledged"):
+                    await db.notification_delivery_queue.update_one(
+                        {"id": job_id},
+                        {"$set": {"status": "cancelled", "terminal_failure_reason": "alert_acknowledged"}},
+                    )
+                    continue
+
+            # 2b. Claim with lease
+            claimed = await db.notification_delivery_queue.find_one_and_update(
+                {
+                    "id": job_id,
+                    "status": {"$in": ["pending", "failed_transient"]},
+                    "lease_owner": None,
+                },
+                {
+                    "$set": {
+                        "status": "in_flight",
+                        "lease_owner": worker_id,
+                        "lease_expires_at": (now_utc + timedelta(seconds=NOTIFICATION_LEASE_SECONDS)).isoformat(),
+                    }
+                },
+                return_document=True,
+            )
+            if claimed is None:
+                continue  # already claimed
+
+            # 2c. Deliver
+            channel = claimed.get("channel", "")
+            handler = CHANNEL_HANDLERS.get(channel)
+            if not handler:
+                await db.notification_delivery_queue.update_one(
+                    {"id": job_id, "lease_owner": worker_id},
+                    {"$set": {
+                        "status": "failed_permanent",
+                        "terminal_failure_reason": f"unknown_channel_{channel}",
+                        "failed_at": now_iso,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }},
+                )
+                continue
+
+            result = await handler(claimed)
+            attempts = int(claimed.get("attempts", 0)) + 1
+
+            if result.get("sent"):
+                await db.notification_delivery_queue.update_one(
+                    {"id": job_id, "lease_owner": worker_id},
+                    {"$set": {
+                        "status": "delivered",
+                        "attempts": attempts,
+                        "last_attempt_at": now_iso,
+                        "provider": result.get("provider"),
+                        "provider_message_id": result.get("provider_message_id"),
+                        "delivered_at": now_iso,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }},
+                )
+            elif result.get("is_permanent") or attempts >= NOTIFICATION_MAX_ATTEMPTS:
+                reason = result.get("error", "unknown")
+                if attempts >= NOTIFICATION_MAX_ATTEMPTS:
+                    reason = f"max_attempts_exhausted ({reason})"
+                await db.notification_delivery_queue.update_one(
+                    {"id": job_id, "lease_owner": worker_id},
+                    {"$set": {
+                        "status": "failed_permanent",
+                        "attempts": attempts,
+                        "last_attempt_at": now_iso,
+                        "last_error": result.get("error", "")[:500],
+                        "terminal_failure_reason": reason[:500],
+                        "failed_at": now_iso,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }},
+                )
+            else:
+                next_retry = compute_next_retry_at(attempts)
+                await db.notification_delivery_queue.update_one(
+                    {"id": job_id, "lease_owner": worker_id},
+                    {"$set": {
+                        "status": "failed_transient",
+                        "attempts": attempts,
+                        "last_attempt_at": now_iso,
+                        "last_error": result.get("error", "")[:500],
+                        "next_retry_at": next_retry,
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                    }},
+                )
+
+            processed += 1
+
+        if processed > 0:
+            logger.info("Notification sweep processed %d jobs", processed)
+    except Exception as e:
+        logger.error("Notification delivery sweep failed: %s", e)
+
+
 async def log_voice_medication_intake(owner_id: str, option: dict) -> dict:
     now_utc = datetime.now(timezone.utc)
     med_id = option.get("medication_id") or ""
@@ -9480,6 +9621,13 @@ async def start_background_schedulers():
             background_scheduler = AsyncIOScheduler()
             background_scheduler.add_job(check_medication_reminders, 'interval', minutes=1, id="medication-reminders", replace_existing=True)
             background_scheduler.add_job(process_all_due_alert_escalations, 'interval', minutes=1, id="safety-escalations", replace_existing=True)
+            background_scheduler.add_job(
+                process_notification_delivery_queue,
+                'interval',
+                seconds=30,
+                id="notification-delivery",
+                replace_existing=True
+            )
             background_scheduler.start()
         logger.info("Background schedulers started")
     except ImportError:
