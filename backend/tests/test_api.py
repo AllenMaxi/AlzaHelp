@@ -10,6 +10,9 @@ from datetime import datetime
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 SESSION_TOKEN = "sess_test_eba950c34a0140878f212a3ad58d66d2"
 
+if not BASE_URL:
+    pytest.skip("REACT_APP_BACKEND_URL is not configured for integration tests.", allow_module_level=True)
+
 @pytest.fixture
 def api_client():
     """Shared requests session with auth header"""
